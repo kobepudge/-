@@ -1,0 +1,834 @@
+# -*- coding: utf-8 -*-
+"""
+AI驱动的黄金期货自主交易策略 (最大AI自主权版本)
+策略名称: DeepSeek Autonomous Gold Futures Trading
+交易品种: au2512.SHFE (黄金期货)
+核心理念: 最小化人为规则,最大化AI决策自由度,只做最后风控
+"""
+
+import json
+import time
+from datetime import datetime, time as datetime_time
+import requests
+from collections import deque
+
+# ========================================
+# 核心配置参数
+# ========================================
+
+class Config:
+    """配置类 - 只包含安全边界和基础设置"""
+
+    # 交易标的
+    SYMBOL = "au2512.SHFE"
+
+    # AI配置
+    DEEPSEEK_API_KEY = "sk-c7c94df2cbbb423698cb895f25534501"
+    DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
+    DEEPSEEK_MODEL = "deepseek-chat"
+
+    # AI决策频率 (秒) - 平衡成本和响应速度
+    AI_DECISION_INTERVAL = 120  # 2分钟一次决策
+
+    # ====== 安全边界 (唯一的硬性约束) ======
+    MAX_SINGLE_TRADE_LOSS_PCT = 0.02   # 单笔最大亏损2%
+    MAX_DAILY_LOSS_PCT = 0.05          # 单日最大亏损5%
+    FORCE_CLOSE_TIME = "14:55:00"      # 强制平仓时间
+    MIN_AI_CONFIDENCE = 0.6            # 最小信心阈值(0-1)
+
+    # 数据窗口大小
+    TICK_WINDOW = 100        # 缓存最近100个tick
+    KLINE_1M_WINDOW = 200    # 1分钟K线200根
+    KLINE_1D_WINDOW = 50     # 日K线50根
+
+    # API重试配置
+    API_TIMEOUT = 10
+    API_MAX_RETRIES = 3
+
+
+# ========================================
+# AI决策核心Prompt
+# ========================================
+
+def construct_autonomous_trading_prompt(market_data):
+    """
+    构造最大化AI自主权的交易Prompt
+
+    设计原则:
+    1. 提供完整市场数据,不做预处理判断
+    2. 不预设交易规则,完全由AI判断
+    3. 只要求AI输出标准化格式
+    4. 强调风险自我评估
+    """
+
+    prompt = f"""# 角色定义
+
+你是一位专业的黄金期货日内交易员,负责管理 au2512.SHFE 的交易头寸。你有完全的决策自主权,需要基于市场数据自主判断:
+- 当前市场状态 (趋势/震荡/反转)
+- 是否应该入场/出场/持有
+- 止损止盈位置
+- 仓位大小
+- 持仓时间预期
+
+# 当前市场数据
+
+## 实时行情
+- **当前价格**: {market_data['current_price']:.2f} 元/克
+- **买一价**: {market_data['bid_price']:.2f}, 量: {market_data['bid_volume']}
+- **卖一价**: {market_data['ask_price']:.2f}, 量: {market_data['ask_volume']}
+- **最新成交量**: {market_data['last_volume']} (单笔)
+- **当前时间**: {market_data['current_time']}
+
+## 量能分析
+- **当前成交量**: {market_data['current_volume']}
+- **20周期均量**: {market_data['avg_volume_20']:.0f}
+- **量能比**: {market_data['volume_ratio']:.2f}x (当前/均量)
+- **量能状态**: {market_data['volume_state']}
+  * EXTREME_SURGE (>3x): 极端放量,可能预示反转
+  * SURGE (1.5-2x): 明显放量,趋势确认或即将反转
+  * NORMAL (0.8-1.5x): 正常量能
+  * LOW (<0.8x): 缩量,趋势可能衰竭
+
+## 技术指标 (1分钟周期)
+- **EMA20**: {market_data['ema_20']:.2f}
+- **EMA60**: {market_data['ema_60']:.2f}
+- **MACD**: {market_data['macd']:.4f}
+- **Signal**: {market_data['macd_signal']:.4f}
+- **Histogram**: {market_data['macd_hist']:.4f}
+- **RSI(14)**: {market_data['rsi']:.2f}
+- **ATR(14)**: {market_data['atr']:.2f} (波动率指标)
+
+## 价格结构 (最近20根1分钟K线)
+- **最高价**: {market_data['high_20']:.2f}
+- **最低价**: {market_data['low_20']:.2f}
+- **价格振幅**: {market_data['price_range_pct']:.2f}%
+
+## 日线信息
+- **日内开盘价**: {market_data['daily_open']:.2f}
+- **日内最高**: {market_data['daily_high']:.2f}
+- **日内最低**: {market_data['daily_low']:.2f}
+- **日内涨跌幅**: {market_data['daily_change_pct']:.2f}%
+
+## 当前持仓状态
+- **持仓方向**: {market_data['position_direction']}
+- **持仓数量**: {market_data['position_volume']}
+- **持仓均价**: {market_data['position_avg_price']:.2f if market_data['position_avg_price'] else 'N/A'}
+- **未实现盈亏**: {market_data['unrealized_pnl']:.2f} 元
+- **未实现盈亏率**: {market_data['unrealized_pnl_pct']:.2f}%
+- **持仓时长**: {market_data['holding_minutes']:.0f} 分钟
+
+## 今日交易统计
+- **今日盈亏**: {market_data['daily_pnl']:.2f} 元
+- **今日盈亏率**: {market_data['daily_pnl_pct']:.2f}%
+- **今日交易次数**: {market_data['daily_trades']}
+- **今日胜率**: {market_data['daily_win_rate']:.1f}%
+
+# 安全约束 (唯一的硬性规则)
+
+1. **单笔最大亏损**: 账户净值的2% (系统会自动强平)
+2. **单日最大亏损**: 账户净值的5% (系统会停止交易)
+3. **强制平仓时间**: 14:55之前必须平仓,不得持仓过夜
+4. **最小信心度**: 你的决策信心度必须≥0.6才会被执行
+
+除此之外,你有完全的自主决策权。
+
+# 交易决策框架 (建议,非强制)
+
+## 市场状态识别
+
+**极端量能市场** (关键!):
+- 放量最后一跌 (CAPITULATION): 价格下跌 + 量能>3x + RSI<20 → 可能是超跌反弹机会
+- 放量顶部 (BLOW_OFF): 价格上涨 + 量能>3x + RSI>80 → 可能是见顶信号
+
+**趋势市场**:
+- 强/弱上升趋势: EMA20>EMA60, MACD>0
+- 强/弱下降趋势: EMA20<EMA60, MACD<0
+
+**震荡市场**:
+- 价格在EMA20上下反复穿越
+- MACD在0轴附近震荡
+
+## 止损止盈设计
+
+你需要自主判断:
+- **止损价格**: 基于技术支撑位/压力位、ATR波动率、趋势强度等
+- **止盈价格**: 基于风险收益比、目标位、阻力位等
+- **失效条件**: 什么市场信号出现时,交易逻辑不再成立?
+
+建议风险收益比≥2:1,但你可以根据市场状况调整。
+
+## 仓位管理
+
+你可以基于信心度调整仓位:
+- 信心度0.9-1.0: 满仓 (100%)
+- 信心度0.7-0.9: 重仓 (70%)
+- 信心度0.6-0.7: 半仓 (50%)
+
+## 持仓时长
+
+你可以自主判断持仓时长:
+- 快速反转交易: 5-15分钟
+- 趋势跟随: 30-120分钟
+- 日内波段: 直到收盘前
+
+# 输出格式 (严格JSON格式)
+
+{{
+  "market_state": "CAPITULATION|BLOW_OFF|STRONG_UPTREND|WEAK_UPTREND|SIDEWAYS|WEAK_DOWNTREND|STRONG_DOWNTREND",
+  "reasoning": "你的完整分析思路,包括: 1)量能状态判断 2)趋势判断 3)技术位分析 4)为什么现在是好的交易机会/应该退出",
+  "signal": "buy|sell|hold|close|adjust_stop",
+  "confidence": 0.75,  // 0-1之间的信心度
+  "entry_price": 550.50,  // 如果是入场信号
+  "stop_loss": 548.00,
+  "stop_loss_reason": "跌破20周期低点548.20,且量能衰竭",
+  "profit_target": 555.00,
+  "profit_target_reason": "前期高点阻力位555.30,风险收益比3:1",
+  "invalidation_condition": "如果RSI重新跌破30,说明反弹失败,立即止损",
+  "position_size_pct": 0.7,  // 建议仓位百分比 (基于信心度)
+  "expected_holding_time_minutes": 15,  // 预期持仓时长
+  "risk_reward_ratio": 3.0  // 风险收益比
+}}
+
+**重要说明**:
+- 如果signal是"hold"且已有持仓,可以输出"adjust_stop"来动态调整止损
+- 如果市场状态变化导致原交易逻辑失效,应立即"close"
+- reasoning字段非常重要,需要说明你的决策依据
+
+现在,请基于以上数据给出你的交易决策。
+"""
+
+    return prompt
+
+
+# ========================================
+# 市场数据处理
+# ========================================
+
+class MarketDataCollector:
+    """市场数据收集器 - 只做数据聚合,不做判断"""
+
+    def __init__(self):
+        self.tick_buffer = deque(maxlen=Config.TICK_WINDOW)
+        self.kline_1m_buffer = []
+        self.kline_1d_buffer = []
+
+    def add_tick(self, tick):
+        """添加tick数据"""
+        self.tick_buffer.append({
+            'price': tick.last_price,
+            'volume': tick.last_volume,
+            'bid': tick.bid_price1,
+            'ask': tick.ask_price1,
+            'bid_vol': tick.bid_volume1,
+            'ask_vol': tick.ask_volume1,
+            'timestamp': tick.strtime
+        })
+
+    def update_klines(self, context):
+        """更新K线数据"""
+        # 使用正确的Gkoudai API: get_market_data() 返回 ArrayManager 对象
+        # 1分钟K线
+        am_1m = get_market_data(Config.SYMBOL, '1m')
+        if am_1m is not None and am_1m.count > 0:
+            # ArrayManager对象有open, high, low, close, volume等numpy数组
+            # 转换为字典列表格式供后续使用
+            self.kline_1m_buffer = []
+            for i in range(am_1m.count):
+                self.kline_1m_buffer.append({
+                    'open': am_1m.open[i],
+                    'high': am_1m.high[i],
+                    'low': am_1m.low[i],
+                    'close': am_1m.close[i],
+                    'volume': am_1m.volume[i]
+                })
+
+        # 日K线
+        am_1d = get_market_data(Config.SYMBOL, '1d')
+        if am_1d is not None and am_1d.count > 0:
+            self.kline_1d_buffer = []
+            for i in range(am_1d.count):
+                self.kline_1d_buffer.append({
+                    'open': am_1d.open[i],
+                    'high': am_1d.high[i],
+                    'low': am_1d.low[i],
+                    'close': am_1d.close[i],
+                    'volume': am_1d.volume[i]
+                })
+
+    def calculate_indicators(self):
+        """计算技术指标"""
+        if len(self.kline_1m_buffer) < 60:
+            print(f"[调试] K线数据不足: {len(self.kline_1m_buffer)}/60, 等待更多数据...")
+            return None
+
+        closes = [k['close'] for k in self.kline_1m_buffer]
+        highs = [k['high'] for k in self.kline_1m_buffer]
+        lows = [k['low'] for k in self.kline_1m_buffer]
+        volumes = [k['volume'] for k in self.kline_1m_buffer]
+
+        # EMA
+        ema_20 = self._calculate_ema(closes, 20)
+        ema_60 = self._calculate_ema(closes, 60)
+
+        # MACD
+        macd, signal, hist = self._calculate_macd(closes)
+
+        # RSI
+        rsi = self._calculate_rsi(closes, 14)
+
+        # ATR
+        atr = self._calculate_atr(highs, lows, closes, 14)
+
+        # 量能分析
+        avg_volume_20 = sum(volumes[-20:]) / 20
+        current_volume = volumes[-1]
+        volume_ratio = current_volume / avg_volume_20 if avg_volume_20 > 0 else 1.0
+
+        if volume_ratio > 3.0:
+            volume_state = "EXTREME_SURGE"
+        elif volume_ratio > 1.5:
+            volume_state = "SURGE"
+        elif volume_ratio < 0.8:
+            volume_state = "LOW"
+        else:
+            volume_state = "NORMAL"
+
+        # 价格结构
+        recent_highs = highs[-20:]
+        recent_lows = lows[-20:]
+        high_20 = max(recent_highs)
+        low_20 = min(recent_lows)
+        price_range_pct = ((high_20 - low_20) / low_20) * 100
+
+        return {
+            'ema_20': ema_20,
+            'ema_60': ema_60,
+            'macd': macd,
+            'macd_signal': signal,
+            'macd_hist': hist,
+            'rsi': rsi,
+            'atr': atr,
+            'avg_volume_20': avg_volume_20,
+            'current_volume': current_volume,
+            'volume_ratio': volume_ratio,
+            'volume_state': volume_state,
+            'high_20': high_20,
+            'low_20': low_20,
+            'price_range_pct': price_range_pct
+        }
+
+    @staticmethod
+    def _calculate_ema(prices, period):
+        """计算EMA"""
+        multiplier = 2 / (period + 1)
+        ema = prices[0]
+        for price in prices[1:]:
+            ema = (price - ema) * multiplier + ema
+        return ema
+
+    @staticmethod
+    def _calculate_macd(prices, fast=12, slow=26, signal=9):
+        """计算MACD"""
+        ema_fast = prices[0]
+        ema_slow = prices[0]
+        mult_fast = 2 / (fast + 1)
+        mult_slow = 2 / (slow + 1)
+
+        for price in prices[1:]:
+            ema_fast = (price - ema_fast) * mult_fast + ema_fast
+            ema_slow = (price - ema_slow) * mult_slow + ema_slow
+
+        macd_line = ema_fast - ema_slow
+
+        # Signal line (简化计算,实际应该用MACD序列的EMA)
+        signal_line = macd_line * 0.8  # 简化
+        histogram = macd_line - signal_line
+
+        return macd_line, signal_line, histogram
+
+    @staticmethod
+    def _calculate_rsi(prices, period=14):
+        """计算RSI"""
+        if len(prices) < period + 1:
+            return 50
+
+        gains = []
+        losses = []
+        for i in range(1, len(prices)):
+            change = prices[i] - prices[i-1]
+            if change > 0:
+                gains.append(change)
+                losses.append(0)
+            else:
+                gains.append(0)
+                losses.append(abs(change))
+
+        avg_gain = sum(gains[-period:]) / period
+        avg_loss = sum(losses[-period:]) / period
+
+        if avg_loss == 0:
+            return 100
+
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
+
+    @staticmethod
+    def _calculate_atr(highs, lows, closes, period=14):
+        """计算ATR"""
+        if len(highs) < period + 1:
+            return 0
+
+        trs = []
+        for i in range(1, len(highs)):
+            high_low = highs[i] - lows[i]
+            high_close = abs(highs[i] - closes[i-1])
+            low_close = abs(lows[i] - closes[i-1])
+            tr = max(high_low, high_close, low_close)
+            trs.append(tr)
+
+        atr = sum(trs[-period:]) / period
+        return atr
+
+
+# ========================================
+# AI决策引擎
+# ========================================
+
+class AIDecisionEngine:
+    """AI决策引擎 - 调用DeepSeek API"""
+
+    @staticmethod
+    def call_deepseek_api(prompt):
+        """调用DeepSeek API获取决策"""
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {Config.DEEPSEEK_API_KEY}'
+        }
+
+        payload = {
+            'model': Config.DEEPSEEK_MODEL,
+            'messages': [
+                {
+                    'role': 'system',
+                    'content': '你是一位专业的期货交易员,擅长技术分析和风险管理。请严格按照JSON格式输出决策。'
+                },
+                {
+                    'role': 'user',
+                    'content': prompt
+                }
+            ],
+            'temperature': 0.3,  # 较低温度保证稳定性
+            'max_tokens': 2000
+        }
+
+        for attempt in range(Config.API_MAX_RETRIES):
+            try:
+                response = requests.post(
+                    Config.DEEPSEEK_API_URL,
+                    headers=headers,
+                    json=payload,
+                    timeout=Config.API_TIMEOUT
+                )
+
+                if response.status_code == 200:
+                    result = response.json()
+                    content = result['choices'][0]['message']['content']
+
+                    # 提取JSON (可能被markdown代码块包裹)
+                    if '```json' in content:
+                        content = content.split('```json')[1].split('```')[0].strip()
+                    elif '```' in content:
+                        content = content.split('```')[1].split('```')[0].strip()
+
+                    decision = json.loads(content)
+                    return decision, None
+                else:
+                    error_msg = f"API错误: {response.status_code} - {response.text}"
+                    if attempt < Config.API_MAX_RETRIES - 1:
+                        time.sleep(2 ** attempt)
+                        continue
+                    return None, error_msg
+
+            except Exception as e:
+                error_msg = f"API调用异常: {str(e)}"
+                if attempt < Config.API_MAX_RETRIES - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                return None, error_msg
+
+        return None, "API调用失败,已达最大重试次数"
+
+
+# ========================================
+# 交易执行引擎
+# ========================================
+
+class TradeExecutor:
+    """交易执行引擎 - 执行AI决策"""
+
+    @staticmethod
+    def execute_decision(context, decision, current_price):
+        """执行AI决策"""
+        signal = decision.get('signal', 'hold')
+        confidence = decision.get('confidence', 0)
+
+        # 信心度检查
+        if confidence < Config.MIN_AI_CONFIDENCE:
+            print(f"AI信心度不足 ({confidence:.2f} < {Config.MIN_AI_CONFIDENCE}), 不执行交易")
+            return
+
+        # 获取当前持仓 (使用正确的Gkoudai API)
+        current_volume = get_pos(Config.SYMBOL)  # 返回整数: 正数=多头, 负数=空头, 0=空仓
+
+        if signal == 'buy' and current_volume == 0:
+            # 开多仓
+            position_size = decision.get('position_size_pct', 0.5)
+            # 简化仓位计算: 假设初始资金10万, 金价550, 1手=1000克
+            volume = max(1, int(context.initial_cash * position_size / current_price / 1000))
+
+            if volume > 0:
+                buy(Config.SYMBOL, current_price, volume)
+                print(f"AI决策: 开多 {volume}手 @ {current_price:.2f}, 信心度={confidence:.2f}")
+                print(f"止损={decision.get('stop_loss'):.2f}, 止盈={decision.get('profit_target'):.2f}")
+
+                # 记录决策和持仓均价
+                context.ai_decision = decision
+                context.entry_time = datetime.now()
+                context.position_avg_price = current_price
+
+        elif signal == 'sell' and current_volume == 0:
+            # 开空仓
+            position_size = decision.get('position_size_pct', 0.5)
+            volume = max(1, int(context.initial_cash * position_size / current_price / 1000))
+
+            if volume > 0:
+                short(Config.SYMBOL, current_price, volume)
+                print(f"AI决策: 开空 {volume}手 @ {current_price:.2f}, 信心度={confidence:.2f}")
+                print(f"止损={decision.get('stop_loss'):.2f}, 止盈={decision.get('profit_target'):.2f}")
+
+                context.ai_decision = decision
+                context.entry_time = datetime.now()
+                context.position_avg_price = current_price
+
+        elif signal == 'close' and current_volume != 0:
+            # 平仓 - 使用send_target_order设置目标仓位为0
+            send_target_order(Config.SYMBOL, 0)
+            print(f"AI决策: 平仓 {abs(current_volume)}手 @ {current_price:.2f}")
+            print(f"原因: {decision.get('reasoning', 'N/A')}")
+
+            context.ai_decision = None
+            context.entry_time = None
+            context.position_avg_price = 0
+
+        elif signal == 'adjust_stop' and current_volume != 0:
+            # 动态调整止损
+            context.ai_decision['stop_loss'] = decision.get('stop_loss')
+            context.ai_decision['profit_target'] = decision.get('profit_target')
+            print(f"AI决策: 调整止损至 {decision.get('stop_loss'):.2f}")
+
+
+# ========================================
+# 风控层 (唯一的硬性约束)
+# ========================================
+
+class RiskController:
+    """风控控制器 - 执行安全边界"""
+
+    @staticmethod
+    def check_and_enforce(context, tick):
+        """检查并执行风控规则"""
+        # 获取当前持仓 (使用正确的Gkoudai API)
+        position_volume = get_pos(Config.SYMBOL)
+
+        if position_volume == 0:
+            return  # 无持仓, 无需风控检查
+
+        current_price = tick.last_price
+
+        # 注意: Gkoudai的get_pos()只返回数量, 无法直接获取持仓均价
+        # 我们需要在开仓时记录均价, 这里使用context保存的持仓信息
+        if not hasattr(context, 'position_avg_price') or context.position_avg_price == 0:
+            # 如果没有记录均价, 暂时无法计算盈亏, 跳过单笔亏损检查
+            print("[警告] 无持仓均价记录, 跳过单笔亏损检查")
+        else:
+            avg_price = context.position_avg_price
+
+            # 计算盈亏
+            if position_volume > 0:  # 多头
+                unrealized_pnl = (current_price - avg_price) * abs(position_volume) * 1000
+            else:  # 空头
+                unrealized_pnl = (avg_price - current_price) * abs(position_volume) * 1000
+
+            account_value = context.initial_cash + unrealized_pnl
+            pnl_pct = unrealized_pnl / account_value if account_value > 0 else 0
+
+            # 1. 单笔最大亏损检查
+            if pnl_pct < -Config.MAX_SINGLE_TRADE_LOSS_PCT:
+                print(f"[警告] 触发单笔最大亏损限制 ({pnl_pct*100:.2f}%), 强制平仓!")
+                send_target_order(Config.SYMBOL, 0)
+                context.ai_decision = None
+                context.position_avg_price = 0
+                return
+
+        # 2. 单日最大亏损检查
+        daily_pnl_pct = context.daily_pnl / context.initial_cash
+        if daily_pnl_pct < -Config.MAX_DAILY_LOSS_PCT:
+            print(f"[警告] 触发单日最大亏损限制 ({daily_pnl_pct*100:.2f}%), 停止交易!")
+            if position_volume != 0:
+                send_target_order(Config.SYMBOL, 0)
+            context.trading_allowed = False
+            context.ai_decision = None
+            context.position_avg_price = 0
+            return
+
+        # 3. 强制平仓时间检查
+        current_time = datetime.strptime(tick.strtime, '%Y-%m-%d %H:%M:%S').time()
+        force_close_time = datetime.strptime(Config.FORCE_CLOSE_TIME, '%H:%M:%S').time()
+
+        if current_time >= force_close_time:
+            print(f"[警告] 到达强制平仓时间 {Config.FORCE_CLOSE_TIME}, 强制平仓!")
+            send_target_order(Config.SYMBOL, 0)
+            context.trading_allowed = False
+            context.ai_decision = None
+            context.position_avg_price = 0
+            return
+
+        # 4. AI设定的止损止盈检查
+        if context.ai_decision:
+            stop_loss = context.ai_decision.get('stop_loss')
+            profit_target = context.ai_decision.get('profit_target')
+
+            if stop_loss and profit_target:
+                if position_volume > 0:  # 多头
+                    if current_price <= stop_loss:
+                        print(f"触发AI止损 ({current_price:.2f} <= {stop_loss:.2f}), 平仓!")
+                        send_target_order(Config.SYMBOL, 0)
+                        context.ai_decision = None
+                        context.position_avg_price = 0
+                        return
+                    elif current_price >= profit_target:
+                        print(f"触发AI止盈 ({current_price:.2f} >= {profit_target:.2f}), 平仓!")
+                        send_target_order(Config.SYMBOL, 0)
+                        context.ai_decision = None
+                        context.position_avg_price = 0
+                        return
+                else:  # 空头
+                    if current_price >= stop_loss:
+                        print(f"触发AI止损 ({current_price:.2f} >= {stop_loss:.2f}), 平仓!")
+                        send_target_order(Config.SYMBOL, 0)
+                        context.ai_decision = None
+                        context.position_avg_price = 0
+                        return
+                    elif current_price <= profit_target:
+                        print(f"触发AI止盈 ({current_price:.2f} <= {profit_target:.2f}), 平仓!")
+                        send_target_order(Config.SYMBOL, 0)
+                        context.ai_decision = None
+                        context.position_avg_price = 0
+                        return
+
+
+# ========================================
+# 策略主函数
+# ========================================
+
+def on_init(context):
+    """策略初始化"""
+    context.symbol = Config.SYMBOL
+    print(f"========== AI自主交易策略启动 ==========")
+    print(f"交易品种: {context.symbol}")
+    print(f"AI决策间隔: {Config.AI_DECISION_INTERVAL}秒")
+    print(f"安全边界: 单笔最大亏损{Config.MAX_SINGLE_TRADE_LOSS_PCT*100:.1f}%, 单日最大亏损{Config.MAX_DAILY_LOSS_PCT*100:.1f}%")
+
+    # 订阅数据
+    subscribe(context.symbol, '1m', Config.KLINE_1M_WINDOW)
+    subscribe(context.symbol, '1d', Config.KLINE_1D_WINDOW)
+
+    # 初始化组件
+    context.data_collector = MarketDataCollector()
+    context.ai_engine = AIDecisionEngine()
+    context.executor = TradeExecutor()
+    context.risk_controller = RiskController()
+
+    # 状态变量
+    context.ai_decision = None
+    context.last_ai_call_time = 0
+    context.entry_time = None
+    context.trading_allowed = True
+
+    # 初始化资金 (Gkoudai平台无context.account()方法, 使用固定初始资金)
+    context.initial_cash = 100000  # 默认10万初始资金
+
+    # 持仓信息追踪 (因为get_pos()只返回数量, 需要手动记录均价)
+    context.position_avg_price = 0
+
+    context.daily_pnl = 0
+    context.daily_trades = 0
+    context.daily_wins = 0
+
+
+def on_tick(context, tick):
+    """Tick级别回调 - 核心交易逻辑"""
+
+    # 缓存tick数据
+    context.data_collector.add_tick(tick)
+
+    # 检查是否应该调用AI
+    current_timestamp = time.time()
+    time_since_last_call = current_timestamp - context.last_ai_call_time
+
+    should_call_ai = (
+        time_since_last_call >= Config.AI_DECISION_INTERVAL
+        and len(context.data_collector.tick_buffer) >= 20
+        and context.trading_allowed
+    )
+
+    if should_call_ai:
+        print(f"[调试] 满足AI调用条件, 开始更新数据...")
+
+        # 更新K线数据
+        context.data_collector.update_klines(context)
+
+        # 计算技术指标
+        indicators = context.data_collector.calculate_indicators()
+
+        if indicators:
+            print(f"[调试] 技术指标计算成功")
+            # 收集市场数据
+            market_data = collect_market_data(context, tick, indicators)
+
+            # 构造Prompt
+            prompt = construct_autonomous_trading_prompt(market_data)
+
+            # 调用AI
+            print("正在调用AI进行决策...")
+            decision, error = context.ai_engine.call_deepseek_api(prompt)
+
+            if decision:
+                print(f"AI决策: {decision.get('signal')}, 市场状态: {decision.get('market_state')}")
+                print(f"AI分析: {decision.get('reasoning', 'N/A')[:200]}...")  # 截断过长内容
+
+                # 执行决策
+                context.executor.execute_decision(context, decision, tick.last_price)
+            else:
+                print(f"[错误] AI调用失败: {error}")
+
+            context.last_ai_call_time = current_timestamp
+
+    # 风控层检查 (每个tick都执行)
+    context.risk_controller.check_and_enforce(context, tick)
+
+
+def on_bar(context, bars):
+    """K线回调 - 用于数据更新"""
+    # K线数据已经在on_tick中通过data_collector.update_klines()更新
+    pass
+
+
+def on_order_status(context, order):
+    """订单状态回调"""
+    # 根据Gkoudai文档, order.status为中文字符串, 如"全部成交"
+    if order.status == "全部成交":
+        print(f"订单成交: {order.direction} {order.offset} {order.volume}手 @ {order.price:.2f}")
+
+        # 更新交易统计 (order.offset为"平"时是平仓)
+        if order.offset == "平":
+            context.daily_trades += 1
+            # 计算盈亏 (简化版本)
+            if context.ai_decision:
+                # 这里应该根据实际成交价格计算,简化处理
+                pass
+
+
+def on_backtest_finished(context, indicator):
+    """回测结束回调"""
+    print("========== 回测结束 ==========")
+    print(f"总收益率: {indicator['累计收益率']*100:.2f}%")
+    print(f"夏普比率: {indicator.get('夏普比率', 'N/A')}")
+    print(f"最大回撤: {indicator['最大回撤']*100:.2f}%")
+    print(f"总交易次数: {context.daily_trades}")
+    print(f"胜率: {context.daily_wins / context.daily_trades * 100 if context.daily_trades > 0 else 0:.1f}%")
+
+
+# ========================================
+# 辅助函数
+# ========================================
+
+def collect_market_data(context, tick, indicators):
+    """收集完整的市场数据用于AI决策"""
+
+    # 持仓信息 (使用正确的Gkoudai API)
+    position_volume = get_pos(Config.SYMBOL)
+    position_avg_price = context.position_avg_price
+
+    # 计算未实现盈亏
+    if position_volume != 0:
+        if position_volume > 0:
+            unrealized_pnl = (tick.last_price - position_avg_price) * abs(position_volume) * 1000
+        else:
+            unrealized_pnl = (position_avg_price - tick.last_price) * abs(position_volume) * 1000
+
+        unrealized_pnl_pct = (unrealized_pnl / (position_avg_price * abs(position_volume) * 1000)) * 100 if position_avg_price > 0 else 0
+    else:
+        unrealized_pnl = 0
+        unrealized_pnl_pct = 0
+
+    # 持仓时长
+    if context.entry_time:
+        holding_minutes = (datetime.now() - context.entry_time).total_seconds() / 60
+    else:
+        holding_minutes = 0
+
+    # 日K线信息
+    if len(context.data_collector.kline_1d_buffer) > 0:
+        today_kline = context.data_collector.kline_1d_buffer[-1]
+        daily_open = today_kline['open']
+        daily_high = today_kline['high']
+        daily_low = today_kline['low']
+        daily_change_pct = ((tick.last_price - daily_open) / daily_open) * 100
+    else:
+        daily_open = tick.last_price
+        daily_high = tick.last_price
+        daily_low = tick.last_price
+        daily_change_pct = 0
+
+    # 持仓方向
+    if position_volume > 0:
+        position_direction = "多头"
+    elif position_volume < 0:
+        position_direction = "空头"
+    else:
+        position_direction = "无持仓"
+
+    # 今日盈亏率
+    daily_pnl_pct = (context.daily_pnl / context.initial_cash) * 100 if context.initial_cash > 0 else 0
+
+    # 今日胜率
+    daily_win_rate = (context.daily_wins / context.daily_trades * 100) if context.daily_trades > 0 else 0
+
+    market_data = {
+        'current_price': tick.last_price,
+        'bid_price': tick.bid_price1,
+        'ask_price': tick.ask_price1,
+        'bid_volume': tick.bid_volume1,
+        'ask_volume': tick.ask_volume1,
+        'last_volume': tick.last_volume,
+        'current_time': tick.strtime,
+        'position_direction': position_direction,
+        'position_volume': position_volume,
+        'position_avg_price': position_avg_price,
+        'unrealized_pnl': unrealized_pnl,
+        'unrealized_pnl_pct': unrealized_pnl_pct,
+        'holding_minutes': holding_minutes,
+        'daily_open': daily_open,
+        'daily_high': daily_high,
+        'daily_low': daily_low,
+        'daily_change_pct': daily_change_pct,
+        'daily_pnl': context.daily_pnl,
+        'daily_pnl_pct': daily_pnl_pct,
+        'daily_trades': context.daily_trades,
+        'daily_win_rate': daily_win_rate,
+        **indicators  # 展开技术指标
+    }
+
+    return market_data
