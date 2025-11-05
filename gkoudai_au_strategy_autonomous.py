@@ -122,8 +122,8 @@ class Config:
     # 最低担保比（equity / margin_used，越高越安全）；若低于该值则禁止新开仓
     MIN_GUARANTEE_RATIO = 1.3
 
-    # 波浪/结构识别参数（ZigZag）
-    # 以百分比阈值识别转折（例如0.3%）；可根据品种调整
+    # 波浪/结构识别参数（ZigZag）默认值
+    # 可被热参数覆盖：zigzag_threshold_pct
     ZIGZAG_THRESHOLD_PCT = 0.3
 
     
@@ -204,10 +204,11 @@ def construct_autonomous_trading_prompt(market_data):
 - **价格振幅**: {market_data['price_range_pct']:.2f}%
 
 ## 日线信息（按交易日聚合的日内口径）
-- **日内开盘价**: {market_data['daily_open']:.2f}
+- **日内开盘价**: {market_data['daily_open']:.2f} (source: {market_data.get('today_open_source','intraday')})
 - **日内最高**: {market_data['daily_high']:.2f}
 - **日内最低**: {market_data['daily_low']:.2f}
 - **日内涨跌幅**: {market_data['daily_change_pct']:.2f}%
+- **昨收**: {market_data.get('prev_close','N/A')}
 
 ## 日线趋势 (已完成日线)
 - **D_EMA20**: {d_ema_20_v:.2f}
@@ -270,7 +271,7 @@ def construct_autonomous_trading_prompt(market_data):
 - 信心度0.6-0.7: 半仓 (50%)
 
 仓位换算说明(用于执行层):
-- 账户初始资金: 100,000元(示例)
+- 账户初始资金: {market_data.get('initial_cash', 0):.0f} 元
 - 合约乘数: {market_data['contract_multiplier']}
 - 建议下单手数 ≈ 初始资金 × position_size_pct ÷ (当前价格 × 合约乘数)
 
@@ -859,12 +860,14 @@ class TradeExecutor:
     @staticmethod
     def execute_decision(context, symbol, decision, tick, state):
         """执行AI决策"""
+        params = get_current_params(context)
         signal = decision.get('signal', 'hold')
-        confidence = decision.get('confidence', 0)
+        confidence = float(decision.get('confidence', 0) or 0)
 
-        # 信心度检查
-        if confidence < Config.MIN_AI_CONFIDENCE:
-            Log(f"AI信心度不足 ({confidence:.2f} < {Config.MIN_AI_CONFIDENCE}), 不执行交易")
+        # 信心度检查（热参数）
+        min_conf = float(params.get('min_ai_confidence', Config.MIN_AI_CONFIDENCE))
+        if confidence < min_conf:
+            Log(f"AI信心度不足 ({confidence:.2f} < {min_conf}), 不执行交易")
             return
 
         # 获取当前持仓 (使用正确的Gkoudai API)
@@ -943,7 +946,8 @@ class TradeExecutor:
             if liq_state == 'THIN':
                 pct = min(pct, 0.3)
             if spread_val and mid_px_val and mid_px_val > 0:
-                if (spread_val / mid_px_val) > 0.001:  # 点差>万分之10
+                spread_limit = float(params.get('spread_ratio_limit', 0.001))
+                if (spread_val / mid_px_val) > spread_limit:
                     pct = min(pct, 0.3)
             return pct
 
@@ -990,7 +994,7 @@ class TradeExecutor:
             if margin_per_lot <= 0:
                 Log(f"[{symbol}] 保证金率异常({long_mr:.4f}), 跳过新仓")
                 return
-            max_lots_by_margin = int((available / (margin_per_lot * Config.NEW_TRADE_MARGIN_BUFFER)))
+            max_lots_by_margin = int((available / (margin_per_lot * float(params.get('new_trade_margin_buffer', Config.NEW_TRADE_MARGIN_BUFFER)))))
             # 同时用 position_size 控制仓位（按权益比例）
             target_notional = equity * position_size
             lots_by_target = int(target_notional / notional_per_lot) if notional_per_lot > 0 else 0
@@ -1009,8 +1013,9 @@ class TradeExecutor:
                 # 下单前担保比校验
                 margin_post = used_margin + volume * margin_per_lot
                 guarantee_ratio = (equity / margin_post) if margin_post > 0 else 999
-                if guarantee_ratio < Config.MIN_GUARANTEE_RATIO:
-                    Log(f"[{symbol}] 担保比不足({guarantee_ratio:.2f} < {Config.MIN_GUARANTEE_RATIO:.2f}), 拒绝新仓")
+                min_gr = float(params.get('min_guarantee_ratio', Config.MIN_GUARANTEE_RATIO))
+                if guarantee_ratio < min_gr:
+                    Log(f"[{symbol}] 担保比不足({guarantee_ratio:.2f} < {min_gr:.2f}), 拒绝新仓")
                     return
 
                 buy(symbol, order_price, volume)
@@ -1048,7 +1053,7 @@ class TradeExecutor:
             if margin_per_lot <= 0:
                 Log(f"[{symbol}] 保证金率异常({short_mr:.4f}), 跳过新仓")
                 return
-            max_lots_by_margin = int((available / (margin_per_lot * Config.NEW_TRADE_MARGIN_BUFFER)))
+            max_lots_by_margin = int((available / (margin_per_lot * float(params.get('new_trade_margin_buffer', Config.NEW_TRADE_MARGIN_BUFFER)))))
             target_notional = equity * position_size
             lots_by_target = int(target_notional / notional_per_lot) if notional_per_lot > 0 else 0
             volume = min(max_lots_by_margin, lots_by_target)
@@ -1065,8 +1070,9 @@ class TradeExecutor:
                 margin_per_lot = notional_per_lot * max(short_mr, 0.01)
                 margin_post = used_margin + volume * margin_per_lot
                 guarantee_ratio = (equity / margin_post) if margin_post > 0 else 999
-                if guarantee_ratio < Config.MIN_GUARANTEE_RATIO:
-                    Log(f"[{symbol}] 担保比不足({guarantee_ratio:.2f} < {Config.MIN_GUARANTEE_RATIO:.2f}), 拒绝新仓")
+                min_gr = float(params.get('min_guarantee_ratio', Config.MIN_GUARANTEE_RATIO))
+                if guarantee_ratio < min_gr:
+                    Log(f"[{symbol}] 担保比不足({guarantee_ratio:.2f} < {min_gr:.2f}), 拒绝新仓")
                     return
 
                 short(symbol, order_price, volume)
@@ -1163,8 +1169,9 @@ class RiskController:
             account_value = acc['equity'] + 0.0
             pnl_pct = unrealized_pnl / account_value if account_value > 0 else 0
 
-            # 1. 单笔最大亏损检查
-            if pnl_pct < -Config.MAX_SINGLE_TRADE_LOSS_PCT:
+            # 1. 单笔最大亏损检查（热参数）
+            max_single = float(get_current_params(context).get('risk_max_single_loss_pct', Config.MAX_SINGLE_TRADE_LOSS_PCT))
+            if pnl_pct < -max_single:
                 Log(f"[{symbol}] [警告] 触发单笔最大亏损限制 ({pnl_pct*100:.2f}%), 强制平仓!")
                 send_target_order(symbol, 0)
                 state['ai_decision'] = None
@@ -1174,7 +1181,8 @@ class RiskController:
         # 2. 单日最大亏损检查（以本地估算的权益为基准）
         base_equity = max(1.0, float(estimate_account(context, symbol, current_price, state)['equity'] or 0.0))
         daily_pnl_pct = context.daily_pnl / base_equity
-        if daily_pnl_pct < -Config.MAX_DAILY_LOSS_PCT:
+        max_daily = float(get_current_params(context).get('risk_max_daily_loss_pct', Config.MAX_DAILY_LOSS_PCT))
+        if daily_pnl_pct < -max_daily:
             Log(f"[{symbol}] [警告] 触发单日最大亏损限制 ({daily_pnl_pct*100:.2f}%), 停止交易!")
             if position_volume != 0:
                 send_target_order(symbol, 0)
@@ -1196,7 +1204,11 @@ class RiskController:
                     current_time = datetime.now().time()
         except Exception:
             current_time = datetime.now().time()
-        force_close_time = datetime.strptime(Config.FORCE_CLOSE_TIME, '%H:%M:%S').time()
+        close_str = str(get_current_params(context).get('force_close_time', Config.FORCE_CLOSE_TIME))
+        try:
+            force_close_time = datetime.strptime(close_str, '%H:%M:%S').time()
+        except Exception:
+            force_close_time = datetime.strptime(Config.FORCE_CLOSE_TIME, '%H:%M:%S').time()
 
         if current_time >= force_close_time:
             Log(f"[{symbol}] [警告] 到达强制平仓时间 {Config.FORCE_CLOSE_TIME}, 强制平仓!")
@@ -1309,6 +1321,12 @@ def on_init(context):
     context.executor = TradeExecutor()
     context.risk_controller = RiskController()
 
+    # 载入热参数（context.params 可覆盖默认）
+    try:
+        load_params(context)
+    except Exception:
+        pass
+
     # 状态变量
     # 每个标的的独立状态
     context.state = {}
@@ -1340,8 +1358,11 @@ def on_init(context):
     context.entry_time = None
     context.trading_allowed = True
 
-    # 初始化资金 (Gkoudai平台无context.account()方法, 使用固定初始资金)
-    context.initial_cash = 100000  # 默认10万初始资金
+    # 初始化资金：支持热参数（默认200万）
+    try:
+        context.initial_cash = float(get_current_params(context).get('initial_cash', 2000000))
+    except Exception:
+        context.initial_cash = 2000000
 
     # 兼容旧字段（单标的模式），多标的时用 context.state[sym]['position_avg_price']
     context.position_avg_price = 0
@@ -1514,8 +1535,12 @@ def on_tick(context, tick):
             dt = datetime.strptime(ts, '%Y-%m-%d %H:%M:%S')
         else:
             dt = getattr(tick, 'datetime', None) or datetime.now()
-        # 交易日映射：夜盘21:00起归属次一自然日
-        if dt.time() >= datetime_time(21,0,0):
+        # 交易日映射：可配置 rollover 小时（默认21点）
+        try:
+            roll_hour = int(get_current_params(context).get('trading_day_rollover_hour', 21))
+        except Exception:
+            roll_hour = 21
+        if dt.time() >= datetime_time(roll_hour,0,0):
             trading_day = (dt.date()).toordinal() + 1
         else:
             trading_day = dt.date().toordinal()
@@ -1558,9 +1583,16 @@ def on_tick(context, tick):
     # 周期性持久化日内统计（每60秒一次）
     try:
         last_persist = state.get('last_intraday_persist_ts') or 0
-        if (time.time() - float(last_persist)) > 60:
+        persist_iv = int(get_current_params(context).get('intraday_persist_interval_secs', 60))
+        if (time.time() - float(last_persist)) > persist_iv:
             _G(f"intraday:{sym}", state.get('intraday'))
             state['last_intraday_persist_ts'] = time.time()
+    except Exception:
+        pass
+
+    # 热参数可能变更，定期重载
+    try:
+        maybe_reload_params(context)
     except Exception:
         pass
 
@@ -1598,7 +1630,7 @@ def on_tick(context, tick):
 
             # 自适应参数（频率/冷却/仓位/追踪）
             try:
-                adaptive = derive_adaptive_defaults(market_data)
+                adaptive = derive_adaptive_defaults(market_data, get_current_params(context))
                 state['adaptive'] = adaptive
                 state['ai_interval_secs'] = adaptive.get('ai_interval_secs', Config.AI_DECISION_INTERVAL)
                 _t = market_data.get('d_trend')
@@ -1742,19 +1774,131 @@ def _safe_get(obj, *names, **kw):
             pass
     return default
 
-def derive_adaptive_defaults(market_data):
-    """根据日线趋势返回自适应参数（频率/冷却/仓位/追踪）。"""
-    trend = str(market_data.get('d_trend') or 'SIDEWAYS').upper()
-    params = Config.ADAPTIVE_PARAMS.get(trend, Config.ADAPTIVE_PARAMS['SIDEWAYS']).copy()
-    # 如果流动性很差则进一步降仓
+# -------- 参数管理（热更新） --------
+DEFAULT_PARAMS = {
+    # 风控
+    'risk_max_single_loss_pct': 0.02,
+    'risk_max_daily_loss_pct': 0.05,
+    'force_close_time': '14:55:00',
+    'min_ai_confidence': 0.6,
+    # 调度与冷却
+    'ai_interval_secs_uptrend': 60,
+    'ai_interval_secs_downtrend': 60,
+    'ai_interval_secs_sideways': 30,
+    'cooldown_minutes_uptrend': 2,
+    'cooldown_minutes_downtrend': 2,
+    'cooldown_minutes_sideways': 1,
+    # 仓位与保证金
+    'position_size_pct': 0.6,
+    'position_size_uptrend': 0.6,
+    'position_size_downtrend': 0.6,
+    'position_size_sideways': 0.3,
+    'new_trade_margin_buffer': 1.05,
+    'min_guarantee_ratio': 1.3,
+    # 流动性/点差gating
+    'spread_ratio_limit': 0.001,
+    'liquidity_score_thin': 0.7,
+    'liquidity_score_thick': 1.5,
+    # 动态追踪默认
+    'trailing_type_uptrend': 'atr',
+    'trailing_atr_mult_uptrend': 2.0,
+    'trailing_type_downtrend': 'atr',
+    'trailing_atr_mult_downtrend': 2.0,
+    'trailing_type_sideways': 'percent',
+    'trailing_percent_sideways': 0.7,
+    # 结构/交易日
+    'zigzag_threshold_pct': 0.3,
+    'trading_day_rollover_hour': 21,
+    'intraday_persist_interval_secs': 60,
+    # 资金
+    'initial_cash': 2000000,
+}
+
+def get_current_params(context):
     try:
-        if market_data.get('liquidity_state') == 'THIN':
-            params['position_size_pct'] = min(params['position_size_pct'], 0.3)
-            # 在震荡里也可缩短冷却避免久等
-            params['cooldown_minutes'] = max(1, int(params.get('cooldown_minutes', 2)))
+        return getattr(context, '_current_params') or DEFAULT_PARAMS
+    except Exception:
+        return DEFAULT_PARAMS
+
+def load_params(context):
+    try:
+        user = getattr(context, 'params', {}) or {}
+        # 仅接受基础类型，可序列化
+        merged = DEFAULT_PARAMS.copy()
+        for k, v in user.items():
+            merged[k] = v
+        context._current_params = merged
+        # 同步 ZigZag 阈值到 Config，便于内部函数使用
+        try:
+            Config.ZIGZAG_THRESHOLD_PCT = float(merged.get('zigzag_threshold_pct', Config.ZIGZAG_THRESHOLD_PCT))
+        except Exception:
+            pass
+        # 记录摘要
+        import json
+        context._params_digest = json.dumps(merged, sort_keys=True)
+        return merged
+    except Exception:
+        context._current_params = DEFAULT_PARAMS
+        context._params_digest = 'default'
+        return DEFAULT_PARAMS
+
+def maybe_reload_params(context):
+    try:
+        import json
+        user = getattr(context, 'params', {}) or {}
+        merged = DEFAULT_PARAMS.copy()
+        for k, v in user.items():
+            merged[k] = v
+        digest = json.dumps(merged, sort_keys=True)
+        if digest != getattr(context, '_params_digest', None):
+            context._current_params = merged
+            context._params_digest = digest
+            try:
+                Config.ZIGZAG_THRESHOLD_PCT = float(merged.get('zigzag_threshold_pct', Config.ZIGZAG_THRESHOLD_PCT))
+            except Exception:
+                pass
     except Exception:
         pass
-    return params
+
+def derive_adaptive_defaults(market_data, params_dict):
+    """根据日线趋势返回自适应参数（频率/冷却/仓位/追踪），来源于当前热参数。"""
+    trend = str(market_data.get('d_trend') or 'SIDEWAYS').upper()
+    key = trend.lower()
+    if key == 'uptrend':
+        p = {
+            'ai_interval_secs': params_dict.get('ai_interval_secs_uptrend', 60),
+            'cooldown_minutes': params_dict.get('cooldown_minutes_uptrend', 2),
+            'position_size_pct': params_dict.get('position_size_uptrend', params_dict.get('position_size_pct', 0.6)),
+            'trailing_type': params_dict.get('trailing_type_uptrend', 'atr'),
+            'trailing_atr_mult': params_dict.get('trailing_atr_mult_uptrend', 2.0),
+            'trailing_percent': 0.0,
+        }
+    elif key == 'downtrend':
+        p = {
+            'ai_interval_secs': params_dict.get('ai_interval_secs_downtrend', 60),
+            'cooldown_minutes': params_dict.get('cooldown_minutes_downtrend', 2),
+            'position_size_pct': params_dict.get('position_size_downtrend', params_dict.get('position_size_pct', 0.6)),
+            'trailing_type': params_dict.get('trailing_type_downtrend', 'atr'),
+            'trailing_atr_mult': params_dict.get('trailing_atr_mult_downtrend', 2.0),
+            'trailing_percent': 0.0,
+        }
+    else:
+        p = {
+            'ai_interval_secs': params_dict.get('ai_interval_secs_sideways', 30),
+            'cooldown_minutes': params_dict.get('cooldown_minutes_sideways', 1),
+            'position_size_pct': params_dict.get('position_size_sideways', 0.3),
+            'trailing_type': params_dict.get('trailing_type_sideways', 'percent'),
+            'trailing_atr_mult': 0.0,
+            'trailing_percent': params_dict.get('trailing_percent_sideways', 0.7),
+        }
+    # 流动性很差则降仓
+    try:
+        if market_data.get('liquidity_state') == 'THIN':
+            p['position_size_pct'] = min(float(p.get('position_size_pct', 0.6)), 0.3)
+            p['cooldown_minutes'] = max(1, int(p.get('cooldown_minutes', 1)))
+    except Exception:
+        pass
+    return p
 
 def estimate_account(context, symbol, last_price, state):
     """基于 get_pos + _G 轻持久化的均价/已实盈亏，估算账户权益/可用/占用保证金。
@@ -1781,7 +1925,11 @@ def estimate_account(context, symbol, last_price, state):
         float_pnl = 0.0
         used_margin = 0.0
 
-    equity = float(getattr(context, 'initial_cash', 0.0)) + realized + float_pnl
+    try:
+        init_cash = float(get_current_params(context).get('initial_cash', getattr(context, 'initial_cash', 0.0)))
+    except Exception:
+        init_cash = float(getattr(context, 'initial_cash', 0.0))
+    equity = init_cash + realized + float_pnl
     available = max(0.0, equity - used_margin)
     return {
         'equity': float(equity),
@@ -2019,7 +2167,11 @@ def collect_market_data(context, symbol, tick, indicators, data_collector, state
 
     # 账户快照：本地估算（get_pos + _G 均价/已实盈亏）
     acc = estimate_account(context, symbol, current_price, state)
-    base_equity = acc['equity'] if acc['equity'] > 0 else max(1.0, float(getattr(context, 'initial_cash', 0.0)))
+    try:
+        init_cash = float(get_current_params(context).get('initial_cash', getattr(context, 'initial_cash', 0.0)))
+    except Exception:
+        init_cash = float(getattr(context, 'initial_cash', 0.0))
+    base_equity = acc['equity'] if acc['equity'] > 0 else max(1.0, init_cash)
     daily_pnl_pct = (context.daily_pnl / base_equity) * 100 if base_equity > 0 else 0
 
     # 今日胜率
@@ -2094,9 +2246,11 @@ def collect_market_data(context, symbol, tick, indicators, data_collector, state
     recent_depths = [t.get('depth5', 0) for t in data_collector.tick_buffer if 'depth5' in t]
     avg_depth = (sum(recent_depths) / len(recent_depths)) if recent_depths else 0
     liquidity_score = ((sum_bid_5 + sum_ask_5) / avg_depth) if avg_depth > 0 else 1.0
-    if liquidity_score < 0.7:
+    thin_th = float(get_current_params(context).get('liquidity_score_thin', 0.7)) if 'context' in globals() else 0.7
+    thick_th = float(get_current_params(context).get('liquidity_score_thick', 1.5)) if 'context' in globals() else 1.5
+    if liquidity_score < thin_th:
         liquidity_state = 'THIN'
-    elif liquidity_score > 1.5:
+    elif liquidity_score > thick_th:
         liquidity_state = 'THICK'
     else:
         liquidity_state = 'NORMAL'
@@ -2138,6 +2292,7 @@ def collect_market_data(context, symbol, tick, indicators, data_collector, state
         'daily_trades': context.daily_trades,
         'daily_win_rate': daily_win_rate,
         'contract_multiplier': PlatformAdapter.get_contract_size(symbol),
+        'initial_cash': float(get_current_params(context).get('initial_cash', getattr(context, 'initial_cash', 0.0))),
         'd_ema_20': indicators.get('d_ema_20', 0),
         'd_ema_60': indicators.get('d_ema_60', 0),
         'd_macd': indicators.get('d_macd', 0),
