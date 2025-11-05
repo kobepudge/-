@@ -18,11 +18,12 @@ Gkoudai平台提供的全局函数 (无需import, 运行时自动可用):
 
 import json
 import time
-import os
 from datetime import datetime, time as datetime_time
 import requests
 import traceback
 from collections import deque
+ 
+import math
 
 # ========================================
 # 核心配置参数
@@ -51,7 +52,8 @@ class Config:
     DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
     DEEPSEEK_MODEL = "deepseek-chat"
     DEEPSEEK_TEMPERATURE = 0.7
-    DEEPSEEK_MAX_TOKENS = 10000
+    # 注意：DeepSeek 通常限制 <= 8192；避免请求超限
+    DEEPSEEK_MAX_TOKENS = 8192
 
     # AI决策频率 (秒) - 平衡成本和响应速度
     AI_DECISION_INTERVAL = 60  # 1分钟一次决策
@@ -72,6 +74,39 @@ class Config:
     API_TIMEOUT = 30  # 增加到30秒,避免网络波动导致超时
     API_MAX_RETRIES = 3
 
+    # 自适应与动态管理
+    ADAPTIVE_PARAMS = {
+        'UPTREND': {
+            'ai_interval_secs': 60,
+            'cooldown_minutes': 2,
+            'position_size_pct': 0.6,
+            'trailing_type': 'atr',
+            'trailing_atr_mult': 2.0,
+            'trailing_percent': 0.0,
+        },
+        'DOWNTREND': {
+            'ai_interval_secs': 60,
+            'cooldown_minutes': 2,
+            'position_size_pct': 0.6,
+            'trailing_type': 'atr',
+            'trailing_atr_mult': 2.0,
+            'trailing_percent': 0.0,
+        },
+        'SIDEWAYS': {
+            'ai_interval_secs': 30,
+            'cooldown_minutes': 1,
+            'position_size_pct': 0.3,
+            'trailing_type': 'percent',
+            'trailing_atr_mult': 0.0,
+            'trailing_percent': 0.7,
+        }
+    }
+
+    # 本地持久化（运行期）
+    STATE_DIR = "state"
+    STATE_FILE = "state/portfolio_runtime.json"
+    SAVE_INTERVAL_SECS = 10
+
     # 兜底保证金率（若平台未提供合约保证金率字段时使用; 数值需按交易所校准）
     DEFAULT_MARGIN_RATIO_LONG = {
         "au2512.SHFE": 0.07,
@@ -86,6 +121,12 @@ class Config:
     NEW_TRADE_MARGIN_BUFFER = 1.05
     # 最低担保比（equity / margin_used，越高越安全）；若低于该值则禁止新开仓
     MIN_GUARANTEE_RATIO = 1.3
+
+    # 波浪/结构识别参数（ZigZag）
+    # 以百分比阈值识别转折（例如0.3%）；可根据品种调整
+    ZIGZAG_THRESHOLD_PCT = 0.3
+
+    
 
 
 # ========================================
@@ -106,6 +147,14 @@ def construct_autonomous_trading_prompt(market_data):
     # 处理可能为 0/None 的持仓均价，避免格式化错误
     _pap = market_data.get('position_avg_price')
     avg_price_str = f"{_pap:.2f}" if (_pap is not None and _pap > 0) else "N/A"
+
+    # 为避免在 f-string 中出现复杂表达式导致解析问题，先取出需要的字段
+    d_ema_20_v = market_data.get('d_ema_20', 0)
+    d_ema_60_v = market_data.get('d_ema_60', 0)
+    d_macd_v = market_data.get('d_macd', 0)
+    d_trend_v = market_data.get('d_trend', 'N/A')
+    zigzag_summary_v = market_data.get('zigzag_summary', 'N/A')
+    fib_summary_v = market_data.get('fib_summary', 'N/A')
 
     head = f"""# 角色定义
 
@@ -140,7 +189,7 @@ def construct_autonomous_trading_prompt(market_data):
 - **五档买深度/卖深度**: {market_data['sum_bid_5']} / {market_data['sum_ask_5']}
 - **流动性评分**: {market_data['liquidity_score']:.2f} ({market_data['liquidity_state']})
 
-## 技术指标 (5分钟周期 - 趋势分析)
+## 技术指标 (1分钟周期 - 入场分析)
 - **EMA20**: {market_data['ema_20']:.2f}
 - **EMA60**: {market_data['ema_60']:.2f}
 - **MACD**: {market_data['macd']:.4f}
@@ -149,16 +198,26 @@ def construct_autonomous_trading_prompt(market_data):
 - **RSI(14)**: {market_data['rsi']:.2f}
 - **ATR(14)**: {market_data['atr']:.2f} (波动率指标)
 
-## 价格结构 (最近5根5分钟K线, 即25分钟)
-- **最高价**: {market_data['high_5']:.2f}
-- **最低价**: {market_data['low_5']:.2f}
+## 价格结构 (最近20根1分钟K线)
+- **最高价**: {market_data['high_20']:.2f}
+- **最低价**: {market_data['low_20']:.2f}
 - **价格振幅**: {market_data['price_range_pct']:.2f}%
 
-## 日线信息
+## 日线信息（按交易日聚合的日内口径）
 - **日内开盘价**: {market_data['daily_open']:.2f}
 - **日内最高**: {market_data['daily_high']:.2f}
 - **日内最低**: {market_data['daily_low']:.2f}
 - **日内涨跌幅**: {market_data['daily_change_pct']:.2f}%
+
+## 日线趋势 (已完成日线)
+- **D_EMA20**: {d_ema_20_v:.2f}
+- **D_EMA60**: {d_ema_60_v:.2f}
+- **D_MACD**: {d_macd_v:.4f}
+- **趋势判定**: {d_trend_v}
+
+## 波浪/结构提示（ZigZag 摘要）
+- **最近枢轴点**: {zigzag_summary_v}
+- **关键斐波水平**: {fib_summary_v}
 
 ## 当前持仓状态
  - **持仓方向**: {market_data['position_direction']}
@@ -242,9 +301,10 @@ def construct_autonomous_trading_prompt(market_data):
   // 入场与目标（若 signal 为 buy/sell 建议给出）
   "entry_price": 550.50,
   "stop_loss": 548.00,
-  "stop_loss_reason": "依据支撑/ATR/结构失效",
-  "profit_target": 555.00,
-  "profit_target_reason": "依据阻力/风险收益比",
+  "stop_loss_reason": "依据结构/ATR",
+  // 止盈交给动态管理（可选初步目标位）
+  "profit_target": null,
+  "profit_target_reason": "可选：初步目标位或规模化减仓触发",
   "invalidation_condition": "什么情况下观点失效，需立即离场",
 
   // 仓位与可交易性
@@ -253,11 +313,21 @@ def construct_autonomous_trading_prompt(market_data):
   "order_price_style": "best|mid|market|limit",
   "limit_offset_ticks": 0,
 
-  // 止盈止损扩展
+  // 动态管理与节拍
   "expected_holding_time_minutes": 15,
-  "risk_reward_ratio": 3.0,
-  "trailing_stop": null,
-  "cooldown_minutes": 0
+  "risk_reward_ratio": 2.0,
+  "trailing_type": "atr|percent|none",
+  "trailing_atr_mult": 2.0,
+  "trailing_percent": 0,
+  "scale_out_levels_r": [1.8, 2.5, 3.0],
+  "scale_out_pcts": [0.33, 0.33, 0.34],
+  "time_stop_minutes": 0,
+  "cooldown_minutes": 0,
+
+  // 波浪/结构（可选）
+  "wave_primary": "Minor Impulse: now in 3",
+  "wave_alt": "Alternate: ending diagonal",
+  "wave_invalidation": 546.50
 }
 """
 
@@ -445,43 +515,28 @@ class MarketDataCollector:
                 Log(f"[警告] query_history('1d') 异常: {e}")
 
     def calculate_indicators(self):
-        """计算技术指标 - 基于5分钟聚合数据"""
-        # 需要至少300根1分钟K线 (60根5分钟K线)
-        if len(self.kline_1m_buffer) < 300:
-            Log(f"[调试] K线数据不足: {len(self.kline_1m_buffer)}/300, 等待更多数据...")
+        """计算技术指标 - 以1分钟为节拍，并附带日线趋势与ZigZag摘要"""
+        if len(self.kline_1m_buffer) < 120:
+            Log(f"[调试] K线数据不足: {len(self.kline_1m_buffer)}/120, 等待更多数据...")
             return None
 
-        # 将1分钟K线聚合为5分钟K线
-        kline_5m_buffer = self._aggregate_to_5min(self.kline_1m_buffer)
+        # 1分钟序列
+        closes_1m = [k['close'] for k in self.kline_1m_buffer]
+        highs_1m = [k['high'] for k in self.kline_1m_buffer]
+        lows_1m = [k['low'] for k in self.kline_1m_buffer]
+        volumes_1m = [k['volume'] for k in self.kline_1m_buffer]
 
-        if len(kline_5m_buffer) < 60:
-            Log(f"[调试] 5分钟K线数据不足: {len(kline_5m_buffer)}/60")
-            return None
+        # 指标（1分钟）
+        ema_20 = self._calculate_ema(closes_1m, 20)
+        ema_60 = self._calculate_ema(closes_1m, 60)
+        macd, signal, hist = self._calculate_macd(closes_1m)
+        rsi = self._calculate_rsi(closes_1m, 14)
+        atr = self._calculate_atr(highs_1m, lows_1m, closes_1m, 14)
 
-        # 从5分钟K线提取数据
-        closes = [k['close'] for k in kline_5m_buffer]
-        highs = [k['high'] for k in kline_5m_buffer]
-        lows = [k['low'] for k in kline_5m_buffer]
-        volumes = [k['volume'] for k in kline_5m_buffer]
-
-        # EMA (基于5分钟周期)
-        ema_20 = self._calculate_ema(closes, 20)  # 20根5分钟 = 100分钟
-        ema_60 = self._calculate_ema(closes, 60)  # 60根5分钟 = 300分钟
-
-        # MACD (基于5分钟周期)
-        macd, signal, hist = self._calculate_macd(closes)
-
-        # RSI (基于5分钟周期)
-        rsi = self._calculate_rsi(closes, 14)
-
-        # ATR (基于5分钟周期)
-        atr = self._calculate_atr(highs, lows, closes, 14)
-
-        # 量能分析 (最近20根5分钟 = 100分钟)
-        avg_volume_20 = sum(volumes[-20:]) / 20
-        current_volume = volumes[-1]
+        # 量能分析（最近20根1分钟）
+        avg_volume_20 = sum(volumes_1m[-20:]) / 20
+        current_volume = volumes_1m[-1]
         volume_ratio = current_volume / avg_volume_20 if avg_volume_20 > 0 else 1.0
-
         if volume_ratio > 3.0:
             volume_state = "EXTREME_SURGE"
         elif volume_ratio > 1.5:
@@ -491,12 +546,41 @@ class MarketDataCollector:
         else:
             volume_state = "NORMAL"
 
-        # 价格结构 (最近5根5分钟 = 25分钟)
-        recent_highs = highs[-5:]
-        recent_lows = lows[-5:]
-        high_5 = max(recent_highs)
-        low_5 = min(recent_lows)
-        price_range_pct = ((high_5 - low_5) / low_5) * 100
+        # 价格结构（最近20根1分钟）
+        window_highs = highs_1m[-20:]
+        window_lows = lows_1m[-20:]
+        high_20 = max(window_highs)
+        low_20 = min(window_lows)
+        price_range_pct = ((high_20 - low_20) / low_20) * 100 if low_20 > 0 else 0
+
+        # 日线趋势（仅使用已完成日线）
+        d_ema_20 = d_ema_60 = d_macd = None
+        d_trend = None
+        if len(self.kline_1d_buffer) >= 60:
+            d_closes = [k['close'] for k in self.kline_1d_buffer]
+            d_ema_20 = self._calculate_ema(d_closes, 20)
+            d_ema_60 = self._calculate_ema(d_closes, 60)
+            d_macd, d_sig, d_hist = self._calculate_macd(d_closes)
+            if d_ema_20 and d_ema_60:
+                if d_ema_20 > d_ema_60 and d_macd > 0:
+                    d_trend = 'UPTREND'
+                elif d_ema_20 < d_ema_60 and d_macd < 0:
+                    d_trend = 'DOWNTREND'
+                else:
+                    d_trend = 'SIDEWAYS'
+
+        # ZigZag（基于1分钟收盘），输出简要摘要供AI分析
+        zigzag = self._calculate_zigzag(closes_1m, threshold_pct=Config.ZIGZAG_THRESHOLD_PCT)
+        zigzag_summary = None
+        fib_summary = None
+        if zigzag and zigzag.get('pivots'):
+            piv = zigzag['pivots'][-6:]
+            zigzag_summary = "; ".join([f"{p['type']}@{p['price']:.2f}" for p in piv])
+            fib = zigzag.get('fib', {})
+            fr = fib.get('retracements', {})
+            fe = fib.get('extensions', {})
+            if fr or fe:
+                fib_summary = f"ret:0.382={fr.get('0.382','')},0.5={fr.get('0.5','')},0.618={fr.get('0.618','')}; ext:1.272={fe.get('1.272','')},1.618={fe.get('1.618','')}"
 
         return {
             'ema_20': ema_20,
@@ -510,9 +594,15 @@ class MarketDataCollector:
             'current_volume': current_volume,
             'volume_ratio': volume_ratio,
             'volume_state': volume_state,
-            'high_5': high_5,
-            'low_5': low_5,
-            'price_range_pct': price_range_pct
+            'high_20': high_20,
+            'low_20': low_20,
+            'price_range_pct': price_range_pct,
+            'd_ema_20': d_ema_20 if d_ema_20 is not None else 0,
+            'd_ema_60': d_ema_60 if d_ema_60 is not None else 0,
+            'd_macd': d_macd if d_macd is not None else 0,
+            'd_trend': d_trend if d_trend else 'N/A',
+            'zigzag_summary': zigzag_summary if zigzag_summary else 'N/A',
+            'fib_summary': fib_summary if fib_summary else 'N/A',
         }
 
     @staticmethod
@@ -610,6 +700,82 @@ class MarketDataCollector:
 
         atr = sum(trs[-period:]) / period
         return atr
+
+    @staticmethod
+    def _calculate_zigzag(closes, threshold_pct=0.3):
+        """简单ZigZag：当价差超过阈值百分比时确认枢轴点。返回最近枢轴与斐波位。"""
+        if not closes or len(closes) < 10:
+            return None
+        th = abs(float(threshold_pct)) / 100.0
+        pivots = []
+        last_pivot_price = closes[0]
+        last_pivot_type = 'H'  # seed, will flip quickly
+        extreme_price = closes[0]
+        extreme_idx = 0
+        direction = 0  # 1 up, -1 down, 0 unknown
+        for i, px in enumerate(closes[1:], start=1):
+            if direction >= 0:
+                # looking for new high
+                if px > extreme_price:
+                    extreme_price = px
+                    extreme_idx = i
+                drawdown = (extreme_price - px) / extreme_price if extreme_price > 0 else 0
+                if direction == 1 and drawdown >= th:
+                    # confirm high
+                    pivots.append({'idx': extreme_idx, 'price': extreme_price, 'type': 'H'})
+                    last_pivot_price = extreme_price
+                    last_pivot_type = 'H'
+                    direction = -1
+                    extreme_price = px
+                    extreme_idx = i
+                elif direction == 0:
+                    # establish initial direction
+                    up_move = (px - last_pivot_price) / last_pivot_price if last_pivot_price > 0 else 0
+                    if up_move >= th:
+                        direction = 1
+                        extreme_price = px
+                        extreme_idx = i
+            if direction <= 0:
+                # looking for new low
+                if px < extreme_price:
+                    extreme_price = px
+                    extreme_idx = i
+                drawup = (px - extreme_price) / extreme_price if extreme_price != 0 else 0
+                if direction == -1 and drawup >= th:
+                    # confirm low
+                    pivots.append({'idx': extreme_idx, 'price': extreme_price, 'type': 'L'})
+                    last_pivot_price = extreme_price
+                    last_pivot_type = 'L'
+                    direction = 1
+                    extreme_price = px
+                    extreme_idx = i
+                elif direction == 0:
+                    down_move = (last_pivot_price - px) / last_pivot_price if last_pivot_price > 0 else 0
+                    if down_move >= th:
+                        direction = -1
+                        extreme_price = px
+                        extreme_idx = i
+
+        # 斐波水平（基于最后一段）
+        fib = {}
+        if len(pivots) >= 2:
+            a = pivots[-2]['price']
+            b = pivots[-1]['price']
+            leg = b - a
+            if leg != 0:
+                def _fmt(v):
+                    return f"{v:.2f}"
+                retr = {
+                    '0.382': _fmt(b - 0.382*leg),
+                    '0.5': _fmt(b - 0.5*leg),
+                    '0.618': _fmt(b - 0.618*leg)
+                }
+                ext = {
+                    '1.272': _fmt(b + 1.272*leg),
+                    '1.618': _fmt(b + 1.618*leg)
+                }
+                fib = {'retracements': retr, 'extensions': ext}
+        return {'pivots': pivots, 'fib': fib}
 
 
 # ========================================
@@ -723,6 +889,28 @@ class TradeExecutor:
         order_price_style = str(decision.get('order_price_style', 'best')).lower()
         tradeability_score = float(decision.get('tradeability_score', 1.0))
         cooldown_minutes = float(decision.get('cooldown_minutes', 0) or 0)
+        # 动态止盈相关（交由AI管理）
+        trailing_type = str(decision.get('trailing_type', 'none') or 'none').lower()
+        trailing_atr_mult = float(decision.get('trailing_atr_mult', 0) or 0)
+        trailing_percent = float(decision.get('trailing_percent', 0) or 0)
+        time_stop_minutes = float(decision.get('time_stop_minutes', 0) or 0)
+
+        # —— 日线自适应默认（若AI未提供则补齐） ——
+        adaptive = state.get('adaptive') or {}
+        if cooldown_minutes <= 0:
+            cooldown_minutes = float(adaptive.get('cooldown_minutes') or 0)
+        # 填仓位默认
+        if not decision.get('position_size_pct') or float(decision.get('position_size_pct') or 0) <= 0:
+            decision['position_size_pct'] = float(adaptive.get('position_size_pct') or 0.5)
+        # 填追踪默认
+        if trailing_type == 'none':
+            ttype = str(adaptive.get('trailing_type') or 'none').lower()
+            if ttype != 'none':
+                trailing_type = ttype
+                if ttype == 'atr' and trailing_atr_mult <= 0:
+                    trailing_atr_mult = float(adaptive.get('trailing_atr_mult') or 0)
+                if ttype == 'percent' and trailing_percent <= 0:
+                    trailing_percent = float(adaptive.get('trailing_percent') or 0)
 
         # 结合市场流动性对仓位/新仓进行 gating
         md = state.get('last_market_data') if isinstance(state, dict) else None
@@ -760,7 +948,8 @@ class TradeExecutor:
             return pct
 
         # 账户与合约参数 —— 用真实数据替代固定值
-        acc = PlatformAdapter.get_account_snapshot(context)
+        # 账户快照：使用本地轻量估算（基于 get_pos + _G 均价/已实盈亏）
+        acc = estimate_account(context, symbol, last_price, state)
         equity = acc['equity']
         available = acc['available']
         used_margin = acc['margin']
@@ -806,9 +995,15 @@ class TradeExecutor:
             target_notional = equity * position_size
             lots_by_target = int(target_notional / notional_per_lot) if notional_per_lot > 0 else 0
             volume = min(max_lots_by_margin, lots_by_target)
-            if volume < max(1, int(min_vol)):
-                Log(f"[{symbol}] 资金/保证金不足, 拒绝新仓. 可用:{available:.0f}, 单手保证金:{margin_per_lot:.0f}")
-                return
+            min_lots = max(1, int(min_vol))
+            if volume < min_lots:
+                # 目标仓位不足1手但保证金充足 → 按最小手数尝试
+                if lots_by_target < min_lots and max_lots_by_margin >= min_lots:
+                    volume = min_lots
+                    Log(f"[{symbol}] 目标仓位不足{min_lots}手，按最小单位下单。可用:{available:.0f}, 单手保证金:{margin_per_lot:.0f}")
+                else:
+                    Log(f"[{symbol}] 保证金不足，拒绝新仓。可用:{available:.0f}, 单手保证金:{margin_per_lot:.0f}")
+                    return
 
             if volume > 0:
                 # 下单前担保比校验
@@ -825,12 +1020,21 @@ class TradeExecutor:
                 _sl_txt = f"{float(_sl):.2f}" if isinstance(_sl, (int, float)) else "N/A"
                 _pt_txt = f"{float(_pt):.2f}" if isinstance(_pt, (int, float)) else "N/A"
                 Log(f"止损={_sl_txt}, 止盈={_pt_txt}")
-                Log(f"[{symbol}] 账户: equity={equity:.0f}, available={available:.0f}, used_margin→{margin_post:.0f}, 担保比={guarantee_ratio:.2f}")
+                Log(f"[{symbol}] 规模: equity={equity:.0f}, available={available:.0f}, notional/lot={notional_per_lot:.0f}, margin/lot={margin_per_lot:.0f}, target_lots={lots_by_target}, max_lots={max_lots_by_margin}, choose={volume}; used_margin→{margin_post:.0f}, 担保比={guarantee_ratio:.2f}")
 
                 # 记录决策和持仓均价
                 state['ai_decision'] = decision
                 state['entry_time'] = datetime.now()
                 state['position_avg_price'] = order_price
+                # 初始化追踪与峰值/谷值
+                state['trailing'] = {
+                    'type': trailing_type,
+                    'atr_mult': trailing_atr_mult,
+                    'percent': trailing_percent,
+                    'time_stop_minutes': time_stop_minutes,
+                }
+                state['peak_price'] = order_price
+                state['trough_price'] = order_price
 
         elif signal == 'sell' and current_volume == 0:
             # 开空仓
@@ -848,9 +1052,14 @@ class TradeExecutor:
             target_notional = equity * position_size
             lots_by_target = int(target_notional / notional_per_lot) if notional_per_lot > 0 else 0
             volume = min(max_lots_by_margin, lots_by_target)
-            if volume < max(1, int(min_vol)):
-                Log(f"[{symbol}] 资金/保证金不足, 拒绝新仓. 可用:{available:.0f}, 单手保证金:{margin_per_lot:.0f}")
-                return
+            min_lots = max(1, int(min_vol))
+            if volume < min_lots:
+                if lots_by_target < min_lots and max_lots_by_margin >= min_lots:
+                    volume = min_lots
+                    Log(f"[{symbol}] 目标仓位不足{min_lots}手，按最小单位下单。可用:{available:.0f}, 单手保证金:{margin_per_lot:.0f}")
+                else:
+                    Log(f"[{symbol}] 保证金不足，拒绝新仓。可用:{available:.0f}, 单手保证金:{margin_per_lot:.0f}")
+                    return
 
             if volume > 0:
                 margin_per_lot = notional_per_lot * max(short_mr, 0.01)
@@ -867,11 +1076,19 @@ class TradeExecutor:
                 _sl_txt = f"{float(_sl):.2f}" if isinstance(_sl, (int, float)) else "N/A"
                 _pt_txt = f"{float(_pt):.2f}" if isinstance(_pt, (int, float)) else "N/A"
                 Log(f"止损={_sl_txt}, 止盈={_pt_txt}")
-                Log(f"[{symbol}] 账户: equity={equity:.0f}, available={available:.0f}, used_margin→{margin_post:.0f}, 担保比={guarantee_ratio:.2f}")
+                Log(f"[{symbol}] 规模: equity={equity:.0f}, available={available:.0f}, notional/lot={notional_per_lot:.0f}, margin/lot={margin_per_lot:.0f}, target_lots={lots_by_target}, max_lots={max_lots_by_margin}, choose={volume}; used_margin→{margin_post:.0f}, 担保比={guarantee_ratio:.2f}")
 
                 state['ai_decision'] = decision
                 state['entry_time'] = datetime.now()
                 state['position_avg_price'] = order_price
+                state['trailing'] = {
+                    'type': trailing_type,
+                    'atr_mult': trailing_atr_mult,
+                    'percent': trailing_percent,
+                    'time_stop_minutes': time_stop_minutes,
+                }
+                state['peak_price'] = order_price
+                state['trough_price'] = order_price
 
         elif signal == 'close' and current_volume != 0:
             # 平仓 - 使用send_target_order设置目标仓位为0
@@ -888,17 +1105,23 @@ class TradeExecutor:
             if isinstance(state.get('ai_decision'), dict):
                 state['ai_decision']['stop_loss'] = decision.get('stop_loss')
                 state['ai_decision']['profit_target'] = decision.get('profit_target')
+                # 同步追踪配置
+                ttype = str(decision.get('trailing_type', state.get('trailing',{}).get('type','none')) or 'none').lower()
+                state['trailing'] = {
+                    'type': ttype,
+                    'atr_mult': float(decision.get('trailing_atr_mult', state.get('trailing',{}).get('atr_mult',0)) or 0),
+                    'percent': float(decision.get('trailing_percent', state.get('trailing',{}).get('percent',0)) or 0),
+                    'time_stop_minutes': float(decision.get('time_stop_minutes', state.get('trailing',{}).get('time_stop_minutes',0)) or 0),
+                }
             _sl = decision.get('stop_loss')
             _sl_txt = f"{float(_sl):.2f}" if isinstance(_sl, (int, float)) else "N/A"
             Log(f"[{symbol}] AI决策: 调整止损至 {_sl_txt}")
 
-        # 冷却时间（可选）：限制后续新仓
-        if cooldown_minutes and cooldown_minutes > 0:
-            try:
-                state['cooldown_until'] = time.time() + cooldown_minutes * 60
-                Log(f"[{symbol}] 进入冷却期 {cooldown_minutes:.0f} 分钟，不再开新仓")
-            except Exception:
-                pass
+        # 冷却时间（改为：仅在成交后由 on_order_status 生效）
+        try:
+            state['pending_cooldown_minutes'] = float(cooldown_minutes or 0)
+        except Exception:
+            state['pending_cooldown_minutes'] = None
 
 
 # ========================================
@@ -935,8 +1158,8 @@ class RiskController:
             else:  # 空头
                 unrealized_pnl = (avg_price - current_price) * abs(position_volume) * mult
 
-            # 账户权益：优先用账户快照
-            acc = PlatformAdapter.get_account_snapshot(context)
+            # 账户权益：使用本地轻量估算
+            acc = estimate_account(context, symbol, current_price, state)
             account_value = acc['equity'] + 0.0
             pnl_pct = unrealized_pnl / account_value if account_value > 0 else 0
 
@@ -948,10 +1171,8 @@ class RiskController:
                 state['position_avg_price'] = 0
                 return
 
-        # 2. 单日最大亏损检查
-        # 单日亏损用账户权益口径更稳妥
-        acc2 = PlatformAdapter.get_account_snapshot(context)
-        base_equity = acc2['equity'] if acc2['equity'] > 0 else max(1.0, float(getattr(context, 'initial_cash', 0.0)))
+        # 2. 单日最大亏损检查（以本地估算的权益为基准）
+        base_equity = max(1.0, float(estimate_account(context, symbol, current_price, state)['equity'] or 0.0))
         daily_pnl_pct = context.daily_pnl / base_equity
         if daily_pnl_pct < -Config.MAX_DAILY_LOSS_PCT:
             Log(f"[{symbol}] [警告] 触发单日最大亏损限制 ({daily_pnl_pct*100:.2f}%), 停止交易!")
@@ -985,38 +1206,85 @@ class RiskController:
             state['position_avg_price'] = 0
             return
 
-        # 4. AI设定的止损止盈检查
+        # 4. AI设定的止损 + 动态追踪/时间止盈检查（止盈不再刚性）
         if state.get('ai_decision'):
             stop_loss = state['ai_decision'].get('stop_loss')
-            profit_target = state['ai_decision'].get('profit_target')
+            # 硬止损：始终生效
+            if stop_loss:
+                if position_volume > 0 and current_price <= stop_loss:
+                    Log(f"[{symbol}] 触发AI止损 ({current_price:.2f} <= {float(stop_loss):.2f}), 平仓!")
+                    send_target_order(symbol, 0)
+                    state['ai_decision'] = None
+                    state['position_avg_price'] = 0
+                    return
+                if position_volume < 0 and current_price >= stop_loss:
+                    Log(f"[{symbol}] 触发AI止损 ({current_price:.2f} >= {float(stop_loss):.2f}), 平仓!")
+                    send_target_order(symbol, 0)
+                    state['ai_decision'] = None
+                    state['position_avg_price'] = 0
+                    return
 
-            if stop_loss and profit_target:
-                if position_volume > 0:  # 多头
-                    if current_price <= stop_loss:
-                        Log(f"[{symbol}] 触发AI止损 ({current_price:.2f} <= {stop_loss:.2f}), 平仓!")
+            # 动态追踪止损（atr/percent）
+            trailing = state.get('trailing') or {}
+            ttype = str(trailing.get('type', 'none') or 'none').lower()
+            if ttype != 'none':
+                try:
+                    # 更新峰值/谷值
+                    if position_volume > 0:
+                        state['peak_price'] = max(float(state.get('peak_price') or current_price), current_price)
+                    else:
+                        state['trough_price'] = min(float(state.get('trough_price') or current_price), current_price)
+                except Exception:
+                    state['peak_price'] = current_price
+                    state['trough_price'] = current_price
+
+                dyn_sl = None
+                atr_mult = float(trailing.get('atr_mult') or 0)
+                pct = float(trailing.get('percent') or 0)
+                md = state.get('last_market_data') if isinstance(state, dict) else None
+                atr_val = (md.get('atr') if isinstance(md, dict) else None) or 0
+                if position_volume > 0:
+                    candidates = []
+                    if ttype == 'atr' and atr_mult > 0 and atr_val > 0:
+                        candidates.append((state.get('peak_price', current_price) - atr_mult * atr_val))
+                    if ttype == 'percent' and pct > 0:
+                        candidates.append((state.get('peak_price', current_price) * (1 - pct/100)))
+                    if candidates:
+                        dyn_sl = max(candidates)
+                        if current_price <= dyn_sl:
+                            Log(f"[{symbol}] 触发动态追踪止损(long): {current_price:.2f} <= {dyn_sl:.2f}")
+                            send_target_order(symbol, 0)
+                            state['ai_decision'] = None
+                            state['position_avg_price'] = 0
+                            return
+                if position_volume < 0:
+                    candidates = []
+                    if ttype == 'atr' and atr_mult > 0 and atr_val > 0:
+                        candidates.append((state.get('trough_price', current_price) + atr_mult * atr_val))
+                    if ttype == 'percent' and pct > 0:
+                        candidates.append((state.get('trough_price', current_price) * (1 + pct/100)))
+                    if candidates:
+                        dyn_sl = min(candidates)
+                        if current_price >= dyn_sl:
+                            Log(f"[{symbol}] 触发动态追踪止损(short): {current_price:.2f} >= {dyn_sl:.2f}")
+                            send_target_order(symbol, 0)
+                            state['ai_decision'] = None
+                            state['position_avg_price'] = 0
+                            return
+
+            # 时间止盈（超时离场）
+            try:
+                ts_min = float(trailing.get('time_stop_minutes') or 0)
+                if ts_min > 0 and state.get('entry_time'):
+                    hold_m = (datetime.now() - state['entry_time']).total_seconds() / 60.0
+                    if hold_m >= ts_min:
+                        Log(f"[{symbol}] 触发时间离场: 持仓{hold_m:.1f}min ≥ {ts_min:.1f}min")
                         send_target_order(symbol, 0)
                         state['ai_decision'] = None
                         state['position_avg_price'] = 0
                         return
-                    elif current_price >= profit_target:
-                        Log(f"[{symbol}] 触发AI止盈 ({current_price:.2f} >= {profit_target:.2f}), 平仓!")
-                        send_target_order(symbol, 0)
-                        state['ai_decision'] = None
-                        state['position_avg_price'] = 0
-                        return
-                else:  # 空头
-                    if current_price >= stop_loss:
-                        Log(f"[{symbol}] 触发AI止损 ({current_price:.2f} >= {stop_loss:.2f}), 平仓!")
-                        send_target_order(symbol, 0)
-                        state['ai_decision'] = None
-                        state['position_avg_price'] = 0
-                        return
-                    elif current_price <= profit_target:
-                        Log(f"[{symbol}] 触发AI止盈 ({current_price:.2f} <= {profit_target:.2f}), 平仓!")
-                        send_target_order(symbol, 0)
-                        state['ai_decision'] = None
-                        state['position_avg_price'] = 0
-                        return
+            except Exception:
+                pass
 
 
 # ========================================
@@ -1053,6 +1321,18 @@ def on_init(context):
             'position_avg_price': 0,
             'last_market_data': None,
             'cooldown_until': None,
+            'intraday': {
+                'trading_day': None,
+                'open': None,
+                'high': None,
+                'low': None,
+                'prev_close': None,
+                'open_time': None,
+                'source': 'intraday'
+            },
+            'trailing': None,
+            'peak_price': None,
+            'trough_price': None,
         }
     # 兼容旧字段（不再使用，保留以避免引用错误）
     context.ai_decision = None
@@ -1069,6 +1349,36 @@ def on_init(context):
     context.daily_pnl = 0
     context.daily_trades = 0
     context.daily_wins = 0
+
+    # 读取 _G 轻持久化的持仓快照（均价/已实盈亏/追踪参数）
+    for sym in context.symbols:
+        try:
+            snap = _G(f"pos:{sym}")
+            if isinstance(snap, dict):
+                # 恢复均价/已实现盈亏/追踪参数/入场时间
+                context.state[sym]['position_avg_price'] = float(snap.get('avg_price') or 0)
+                context.state[sym]['realized_pnl'] = float(snap.get('realized_pnl') or 0)
+                context.state[sym]['trailing'] = snap.get('trailing') or None
+                et = snap.get('entry_time')
+                if et:
+                    try:
+                        context.state[sym]['entry_time'] = datetime.strptime(et, '%Y-%m-%d %H:%M:%S')
+                    except Exception:
+                        context.state[sym]['entry_time'] = None
+        except Exception:
+            pass
+        # 填充默认键
+        if 'realized_pnl' not in context.state[sym]:
+            context.state[sym]['realized_pnl'] = 0.0
+        if 'pending_cooldown_minutes' not in context.state[sym]:
+            context.state[sym]['pending_cooldown_minutes'] = None
+        # 恢复日内统计（可选）
+        try:
+            intr = _G(f"intraday:{sym}")
+            if isinstance(intr, dict):
+                context.state[sym]['intraday'].update(intr)
+        except Exception:
+            pass
 
 
 def on_start(context):
@@ -1195,13 +1505,74 @@ def on_tick(context, tick):
     state = context.state[sym]
     dc = state['data_collector']
     dc.add_tick(tick)
+    # 更新最新价（用于本地估算账户）—直接在估算函数里使用 tick.last_price，无需保存
+
+    # 更新本交易日的日内统计（开/高/低）
+    try:
+        ts = getattr(tick, 'strtime', None)
+        if ts:
+            dt = datetime.strptime(ts, '%Y-%m-%d %H:%M:%S')
+        else:
+            dt = getattr(tick, 'datetime', None) or datetime.now()
+        # 交易日映射：夜盘21:00起归属次一自然日
+        if dt.time() >= datetime_time(21,0,0):
+            trading_day = (dt.date()).toordinal() + 1
+        else:
+            trading_day = dt.date().toordinal()
+        td_key = trading_day
+        intr = state.get('intraday', {})
+        cur_px = getattr(tick, 'last_price', getattr(tick, 'price', 0))
+        if intr.get('trading_day') != td_key:
+            # 新交易日初始化
+            intr = {
+                'trading_day': td_key,
+                'open': cur_px,
+                'high': cur_px,
+                'low': cur_px,
+                'open_time': ts or dt.strftime('%Y-%m-%d %H:%M:%S'),
+                'prev_close': None,
+                'source': 'intraday',
+            }
+            # 设置昨日收盘（若有）
+            try:
+                if dc.kline_1d_buffer:
+                    last_d = dc.kline_1d_buffer[-1]
+                    intr['prev_close'] = last_d['close']
+            except Exception:
+                pass
+            state['intraday'] = intr
+        else:
+            # 更新高低
+            try:
+                if cur_px is not None:
+                    if intr.get('high') is None or cur_px > intr['high']:
+                        intr['high'] = cur_px
+                    if intr.get('low') is None or cur_px < intr['low']:
+                        intr['low'] = cur_px
+            except Exception:
+                pass
+            state['intraday'] = intr
+    except Exception:
+        pass
+
+    # 周期性持久化日内统计（每60秒一次）
+    try:
+        last_persist = state.get('last_intraday_persist_ts') or 0
+        if (time.time() - float(last_persist)) > 60:
+            _G(f"intraday:{sym}", state.get('intraday'))
+            state['last_intraday_persist_ts'] = time.time()
+    except Exception:
+        pass
 
     # 检查是否应该调用AI
     current_timestamp = time.time()
     time_since_last_call = current_timestamp - state['last_ai_call_time']
 
+    # 自适应AI调用间隔（基于日线趋势），默认回退为配置值
+    ai_interval = state.get('ai_interval_secs', Config.AI_DECISION_INTERVAL)
+
     should_call_ai = (
-        time_since_last_call >= Config.AI_DECISION_INTERVAL
+        time_since_last_call >= ai_interval
         and len(dc.tick_buffer) >= 20
         and context.trading_allowed
     )
@@ -1218,10 +1589,24 @@ def on_tick(context, tick):
         if indicators:
             Log(f"[调试] 技术指标计算成功")
             # 收集市场数据
-            market_data = collect_market_data(context, sym, tick, indicators, dc, state['position_avg_price'])
+            market_data = collect_market_data(context, sym, tick, indicators, dc, state)
             # 记录最新市场快照供执行层做流动性与点差gating
             try:
                 state['last_market_data'] = market_data
+            except Exception:
+                pass
+
+            # 自适应参数（频率/冷却/仓位/追踪）
+            try:
+                adaptive = derive_adaptive_defaults(market_data)
+                state['adaptive'] = adaptive
+                state['ai_interval_secs'] = adaptive.get('ai_interval_secs', Config.AI_DECISION_INTERVAL)
+                _t = market_data.get('d_trend')
+                _intv = state['ai_interval_secs']
+                _cd = adaptive.get('cooldown_minutes')
+                _pos = adaptive.get('position_size_pct')
+                _trl = adaptive.get('trailing_type')
+                Log("[{}] 自适应: trend={}, interval={}s, cooldown={}m, pos={}, trailing={}".format(sym, _t, _intv, _cd, _pos, _trl))
             except Exception:
                 pass
 
@@ -1251,7 +1636,7 @@ def on_tick(context, tick):
             need_log = True
         if need_log:
             reason = []
-            if time_since_last_call < Config.AI_DECISION_INTERVAL:
+            if time_since_last_call < ai_interval:
                 reason.append("间隔未到")
             if len(dc.tick_buffer) < 20:
                 reason.append("tick不足:%d/20" % len(dc.tick_buffer))
@@ -1260,6 +1645,17 @@ def on_tick(context, tick):
             if reason:
                 Log("[%s] 未触发AI: %s" % (sym, ",".join(reason)))
             context.last_noai_log_t = current_timestamp
+
+    # 每60秒打印一次本地账户快照（估算），便于观察可用资金/担保比
+        try:
+            last_pf_log = getattr(context, 'last_portfolio_log_ts', 0) or 0
+            if (current_timestamp - float(last_pf_log)) > 60:
+                lp = getattr(tick, 'last_price', getattr(tick, 'price', 0))
+                snap = estimate_account(context, sym, lp, state)
+                Log(f"[账户] snapshot(估算): equity={snap['equity']:.0f}, available={snap['available']:.0f}, margin={snap['margin']:.0f}")
+                context.last_portfolio_log_ts = current_timestamp
+        except Exception:
+            pass
 
     # 风控层检查 (每个tick都执行、按标的)
     context.risk_controller.check_and_enforce(context, sym, tick, state)
@@ -1277,13 +1673,47 @@ def on_order_status(context, order):
     if order.status == "全部成交":
         Log(f"订单成交: {order.direction} {order.offset} {order.volume}手 @ {order.price:.2f}")
 
-        # 更新交易统计 (order.offset为"平"时是平仓)
-        if order.offset == "平":
-            context.daily_trades += 1
-            # 计算盈亏 (简化版本)
-            if context.ai_decision:
-                # 这里应该根据实际成交价格计算,简化处理
+        # 本地持仓均价/已实盈亏更新 + _G 持久化
+        try:
+            sym = getattr(order, 'symbol', None)
+            if sym:
+                update_pos_snapshot_on_fill(context, sym,
+                    direction=getattr(order, 'direction', ''),
+                    offset=getattr(order, 'offset', ''),
+                    price=float(getattr(order, 'price', 0.0) or 0),
+                    volume=int(getattr(order, 'volume', 0) or 0))
+        except Exception as e:
+            try:
+                Log(f"[警告] 本地持仓快照更新失败: {e}")
+            except Exception:
                 pass
+
+        # 更新交易统计 (order.offset为"平"时是平仓)
+        try:
+            if getattr(order, 'offset', '') == "平":
+                context.daily_trades += 1
+        except Exception:
+            pass
+
+        # 成交后进入冷却（仅限开仓）
+        try:
+            sym = getattr(order, 'symbol', None)
+            if sym:
+                st = context.state.get(sym, {})
+                if str(getattr(order, 'offset', '')) in ("开", "open", "OPEN"):
+                    cd = st.get('pending_cooldown_minutes')
+                    if not cd or cd <= 0:
+                        # 按日线趋势自适应
+                        md = st.get('last_market_data') or {}
+                        trend = str(md.get('d_trend') or 'SIDEWAYS')
+                        params = Config.ADAPTIVE_PARAMS.get(trend, Config.ADAPTIVE_PARAMS['SIDEWAYS'])
+                        cd = float(params.get('cooldown_minutes') or 0)
+                    if cd and cd > 0:
+                        st['cooldown_until'] = time.time() + cd * 60
+                        Log(f"[{sym}] 成交后进入冷却 {cd:.0f} 分钟")
+                    st['pending_cooldown_minutes'] = None
+        except Exception:
+            pass
 
 
 def on_backtest_finished(context, indicator):
@@ -1311,6 +1741,144 @@ def _safe_get(obj, *names, **kw):
         except Exception:
             pass
     return default
+
+def derive_adaptive_defaults(market_data):
+    """根据日线趋势返回自适应参数（频率/冷却/仓位/追踪）。"""
+    trend = str(market_data.get('d_trend') or 'SIDEWAYS').upper()
+    params = Config.ADAPTIVE_PARAMS.get(trend, Config.ADAPTIVE_PARAMS['SIDEWAYS']).copy()
+    # 如果流动性很差则进一步降仓
+    try:
+        if market_data.get('liquidity_state') == 'THIN':
+            params['position_size_pct'] = min(params['position_size_pct'], 0.3)
+            # 在震荡里也可缩短冷却避免久等
+            params['cooldown_minutes'] = max(1, int(params.get('cooldown_minutes', 2)))
+    except Exception:
+        pass
+    return params
+
+def estimate_account(context, symbol, last_price, state):
+    """基于 get_pos + _G 轻持久化的均价/已实盈亏，估算账户权益/可用/占用保证金。
+    用于在平台无账户接口时，给AI/风控提供足够准确的视角。
+    """
+    try:
+        pos = int(get_pos(symbol))
+    except Exception:
+        pos = 0
+    avg = float(state.get('position_avg_price') or 0)
+    realized = float(state.get('realized_pnl') or 0)
+    mult = PlatformAdapter.get_contract_size(symbol)
+    long_mr = PlatformAdapter.get_margin_ratio(symbol, 'long')
+    short_mr = PlatformAdapter.get_margin_ratio(symbol, 'short')
+
+    # 浮动盈亏
+    if pos > 0:
+        float_pnl = (last_price - avg) * abs(pos) * mult
+        used_margin = abs(pos) * last_price * mult * max(long_mr, 0.01)
+    elif pos < 0:
+        float_pnl = (avg - last_price) * abs(pos) * mult
+        used_margin = abs(pos) * last_price * mult * max(short_mr, 0.01)
+    else:
+        float_pnl = 0.0
+        used_margin = 0.0
+
+    equity = float(getattr(context, 'initial_cash', 0.0)) + realized + float_pnl
+    available = max(0.0, equity - used_margin)
+    return {
+        'equity': float(equity),
+        'available': float(available),
+        'margin': float(used_margin),
+        'source': 'local_estimate'
+    }
+
+def update_pos_snapshot_on_fill(context, symbol, direction, offset, price, volume):
+    """在全部成交后，基于成交信息更新本地均价与已实现盈亏，并持久化到 _G。
+    规则：
+    - pos_after = get_pos(symbol)
+    - 根据方向/offset 推算 delta 与 pos_before
+    - 按同向加仓/平仓/反手的情形更新 avg/realized
+    """
+    try:
+        pos_after = int(get_pos(symbol))
+    except Exception:
+        pos_after = 0
+    side_buy = ("买" in str(direction)) or (str(direction).lower().startswith('buy'))
+    is_open = ("开" in str(offset)) or (str(offset).lower().startswith('open'))
+    delta = (volume if side_buy else -volume) if is_open else (0)  # 开仓才改变符号方向
+    # 平仓的 delta 不直接使用；用 pos_after 与逻辑推回 pos_before
+    if is_open:
+        pos_before = pos_after - delta
+    else:
+        # 平仓：pos_after = pos_before - close_qty*sign(pos_before)
+        # 推回 pos_before
+        if pos_after > 0:
+            pos_before = pos_after + volume  # 平多 volume 后剩 pos_after
+        elif pos_after < 0:
+            pos_before = pos_after - volume  # 平空 volume 后剩 pos_after
+        else:
+            # 完全平仓：pos_before 的符号取决于方向
+            pos_before = volume if not side_buy else -volume
+
+    st = context.state.get(symbol, {})
+    avg = float(st.get('position_avg_price') or 0)
+    realized = float(st.get('realized_pnl') or 0)
+    mult = PlatformAdapter.get_contract_size(symbol)
+
+    # 计算
+    if is_open:
+        # 同向加仓 or 反向“开仓”
+        if pos_before == 0 or (pos_before > 0 and side_buy) or (pos_before < 0 and not side_buy):
+            # 同向加仓
+            total_qty = abs(pos_before) + volume
+            new_avg = ((abs(pos_before) * avg) + volume * price) / total_qty if total_qty > 0 else price
+            st['position_avg_price'] = new_avg
+        else:
+            # 反向但标注为开：先平掉一部分，再把余额视为反手
+            close_qty = min(abs(pos_before), volume)
+            if pos_before > 0 and not side_buy:
+                realized += (avg - price) * close_qty * mult
+            elif pos_before < 0 and side_buy:
+                realized += (price - avg) * close_qty * mult
+            remain = volume - close_qty
+            if pos_after == 0:
+                st['position_avg_price'] = 0.0
+            else:
+                if remain > 0:
+                    st['position_avg_price'] = price
+        st['realized_pnl'] = realized
+    else:
+        # 平仓
+        close_qty = volume
+        if pos_before > 0 and not side_buy:
+            realized += (price - avg) * close_qty * mult
+        elif pos_before < 0 and side_buy:
+            realized += (avg - price) * close_qty * mult
+        st['realized_pnl'] = realized
+        if pos_after == 0:
+            st['position_avg_price'] = 0.0
+        else:
+            # 部分平仓保留原均价
+            st['position_avg_price'] = avg
+
+    # 入场时间维护：首次持仓或反手更新
+    try:
+        if st.get('entry_time') is None and pos_after != 0:
+            st['entry_time'] = datetime.now()
+        if pos_after == 0:
+            st['entry_time'] = None
+    except Exception:
+        pass
+
+    # 持久化到 _G
+    try:
+        et_str = st.get('entry_time').strftime('%Y-%m-%d %H:%M:%S') if st.get('entry_time') else None
+        _G(f"pos:{symbol}", {
+            'avg_price': float(st.get('position_avg_price') or 0.0),
+            'realized_pnl': float(st.get('realized_pnl') or 0.0),
+            'entry_time': et_str,
+            'trailing': st.get('trailing') or None,
+        })
+    except Exception:
+        pass
 
 class PlatformAdapter:
     """封装平台相关的取数，尽量兼容不同接口命名。"""
@@ -1399,38 +1967,11 @@ class PlatformAdapter:
             return float(Config.DEFAULT_MARGIN_RATIO_LONG.get(symbol, 0.1))
         return float(Config.DEFAULT_MARGIN_RATIO_SHORT.get(symbol, 0.1))
 
-    @staticmethod
-    def get_account_snapshot(context):
-        acc = PlatformAdapter.get_account(context)
-        if acc is None:
-            # 退化：用旧的 initial_cash
-            return {
-                'equity': getattr(context, 'initial_cash', 0.0),
-                'available': getattr(context, 'initial_cash', 0.0),
-                'margin': 0.0,
-            }
-        # 常见字段：balance(余额)、available(可用)、margin(占用)、position_profit/float_pnl(持仓盈亏)
-        balance = _safe_get(acc, 'balance', default=0.0) or 0.0
-        available = _safe_get(acc, 'available', default=0.0) or 0.0
-        margin = _safe_get(acc, 'margin', default=0.0) or 0.0
-        close_profit = _safe_get(acc, 'close_profit', default=0.0) or 0.0
-        position_profit = _safe_get(acc, 'position_profit', default=0.0) or 0.0
-        float_pnl = _safe_get(acc, 'float_pnl', default=0.0) or 0.0
+    
 
-        # 多平台字段语义不同，尽量避免重复计入。这里取一个保守口径：
-        # equity ≈ balance + position_profit + close_profit（如 float_pnl 已包含，则忽略）
-        equity = balance + position_profit + close_profit
-        # 若 equity 明显为 0 且 available > 0，则用 available + margin 近似
-        if equity <= 0 and (available > 0 or margin > 0):
-            equity = available + margin
+ 
 
-        return {
-            'equity': float(equity),
-            'available': float(available),
-            'margin': float(margin),
-        }
-
-def collect_market_data(context, symbol, tick, indicators, data_collector, position_avg_price):
+def collect_market_data(context, symbol, tick, indicators, data_collector, state):
     """收集完整的市场数据用于AI决策"""
 
     # 持仓信息 (使用正确的Gkoudai API)
@@ -1439,6 +1980,7 @@ def collect_market_data(context, symbol, tick, indicators, data_collector, posit
     # 计算未实现盈亏
     current_price = getattr(tick, 'last_price', getattr(tick, 'price', 0))
     mult = PlatformAdapter.get_contract_size(symbol)
+    position_avg_price = state.get('position_avg_price') or 0
     if position_volume != 0:
         if position_volume > 0:
             unrealized_pnl = (current_price - position_avg_price) * abs(position_volume) * mult
@@ -1460,18 +2002,12 @@ def collect_market_data(context, symbol, tick, indicators, data_collector, posit
     else:
         holding_minutes = 0
 
-    # 日K线信息
-    if len(data_collector.kline_1d_buffer) > 0:
-        today_kline = data_collector.kline_1d_buffer[-1]
-        daily_open = today_kline['open']
-        daily_high = today_kline['high']
-        daily_low = today_kline['low']
-        daily_change_pct = ((tick.last_price - daily_open) / daily_open) * 100
-    else:
-        daily_open = tick.last_price
-        daily_high = tick.last_price
-        daily_low = tick.last_price
-        daily_change_pct = 0
+    # 日内统计（以交易日为口径）
+    intr = state.get('intraday', {})
+    daily_open = intr.get('open', tick.last_price)
+    daily_high = intr.get('high', tick.last_price)
+    daily_low = intr.get('low', tick.last_price)
+    daily_change_pct = ((tick.last_price - daily_open) / daily_open) * 100 if daily_open else 0
 
     # 持仓方向
     if position_volume > 0:
@@ -1481,8 +2017,8 @@ def collect_market_data(context, symbol, tick, indicators, data_collector, posit
     else:
         position_direction = "无持仓"
 
-    # 今日盈亏率
-    acc = PlatformAdapter.get_account_snapshot(context)
+    # 账户快照：本地估算（get_pos + _G 均价/已实盈亏）
+    acc = estimate_account(context, symbol, current_price, state)
     base_equity = acc['equity'] if acc['equity'] > 0 else max(1.0, float(getattr(context, 'initial_cash', 0.0)))
     daily_pnl_pct = (context.daily_pnl / base_equity) * 100 if base_equity > 0 else 0
 
@@ -1569,6 +2105,7 @@ def collect_market_data(context, symbol, tick, indicators, data_collector, posit
         'account_equity': acc['equity'],
         'account_available': acc['available'],
         'account_margin': acc['margin'],
+        'account_source': acc.get('source', 'local_estimate'),
         'symbol': symbol,
         'current_price': current_price,
         'bid_price': bid_price,
@@ -1601,6 +2138,12 @@ def collect_market_data(context, symbol, tick, indicators, data_collector, posit
         'daily_trades': context.daily_trades,
         'daily_win_rate': daily_win_rate,
         'contract_multiplier': PlatformAdapter.get_contract_size(symbol),
+        'd_ema_20': indicators.get('d_ema_20', 0),
+        'd_ema_60': indicators.get('d_ema_60', 0),
+        'd_macd': indicators.get('d_macd', 0),
+        'd_trend': indicators.get('d_trend', 'N/A'),
+        'zigzag_summary': indicators.get('zigzag_summary', 'N/A'),
+        'fib_summary': indicators.get('fib_summary', 'N/A'),
         **indicators  # 展开技术指标
     }
 
