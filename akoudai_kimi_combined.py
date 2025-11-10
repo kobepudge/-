@@ -95,22 +95,16 @@ class Config:
     LIQUIDITY_SCORE_THIN = 0.7
     LIQUIDITY_SCORE_THICK = 1.5
     TRADING_DAY_ROLLOVER_HOUR = 21
-    # 启动阶段是否立即触发一次AI（快照就绪且未在冷却，tick触发关闭时）。默认关闭以避免启动期None。
+    # 启动阶段是否立即触发一次AI（快照就绪且未在冷却，tick触发关闭时）。默认关闭。
     ENABLE_STARTUP_AI_TRIGGER = False
     INTRADAY_PERSIST_INTERVAL_SECS = 60
     INITIAL_CASH = 2000000
     # 是否使用 _G 做持仓/均价等持久化（False 表示仅运行期内维护，重启后不恢复）
     USE_PERSISTENT_SNAPSHOT = False
-    # 是否信任平台 get_pos() 的返回（用户反馈其不可靠）；False 时仅使用运行期本地持仓
+    # 是否信任平台 get_pos() 的返回；False 时仅使用运行期本地持仓
     USE_PLATFORM_GET_POS = False
     # 执行前简要检查日志（定位静默跳过原因）
     DEBUG_EXEC_CHECK = True
-    # 单向模式：持仓不允许反向“新开”。当持多且收到 sell → 先平多；持空且收到 buy → 先平空。
-    SINGLE_SIDE_MODE = True
-    # 允许同向加仓（按AI给出的 position_size_pct 计算目标仓位，按“目标-当前”的差额加仓）。
-    ALLOW_SAME_SIDE_PYRAMIDING = True
-    # 启动时对齐一次平台持仓到本地视图（只读取数量，不改变均价），避免重启后的短窗不一致。
-    ALIGN_POS_ON_INIT = True
 
     # 数据窗口大小
     TICK_WINDOW = 100        # 缓存最近100个tick
@@ -175,7 +169,6 @@ class Config:
     NEW_TRADE_MARGIN_BUFFER = 1.05
     # 最低担保比（equity / margin_used，越高越安全）；若低于该值则禁止新开仓
     MIN_GUARANTEE_RATIO = 1.3
-
     # 入场止损护栏（方向+最小间距）
     MIN_STOP_TICKS = 5
     MIN_STOP_ATR_MULT = 0.25
@@ -1116,13 +1109,10 @@ def local_get_pos(context, symbol, state):
             return int(lp)
     except Exception:
         pass
-    # 根据配置决定是否信任平台 get_pos
     try:
         if getattr(Config, 'USE_PLATFORM_GET_POS', False):
             return int(get_pos(symbol))
         else:
-            # 不信任平台返回，则认为当前为空仓（直到 on_order_status 维护出本地值）
-            # 仅提示一次，避免刷屏
             try:
                 if isinstance(state, dict) and not state.get('_logged_no_pos_hint'):
                     Log(f"[{symbol}] [提示] 未初始化本地持仓且未启用平台get_pos，默认按空仓处理")
@@ -1177,15 +1167,6 @@ class TradeExecutor:
             or getattr(tick, 'ask_price', None)
             or last_price
         )
-        # 安全数值化，避免 None 参与格式化/比较
-        def _nf(v, d=0.0):
-            try:
-                return float(v)
-            except Exception:
-                return float(d)
-        last_price = _nf(last_price, 0.0)
-        bid_price = _nf(bid_price, last_price)
-        ask_price = _nf(ask_price, last_price)
 
         # 读取AI可选字段
         order_price_style = str(decision.get('order_price_style', 'best')).lower()
@@ -1218,11 +1199,27 @@ class TradeExecutor:
         md = state.get('last_market_data') if isinstance(state, dict) else None
         liq_state = md.get('liquidity_state') if isinstance(md, dict) else None
         spread_val = md.get('spread') if isinstance(md, dict) else None
-        mid_px_val = md.get('mid_price') if isinstance(md, dict) else last_price
+        # 数值化小工具，避免 None/NaN/Inf 导致格式化/比较异常
+        def _nf(v, d=0.0):
+            try:
+                f = float(v)
+                if not math.isfinite(f):
+                    return float(d)
+                return f
+            except Exception:
+                return float(d)
+
+        last_price = _nf(last_price, 0.0)
+        bid_price = _nf(bid_price, last_price)
+        ask_price = _nf(ask_price, last_price)
+        mid_px_val = _nf(md.get('mid_price') if isinstance(md, dict) else last_price, last_price)
+
+        # 执行前检查
         try:
-            mid_px_val = float(mid_px_val) if mid_px_val is not None else last_price
+            if getattr(Config, 'DEBUG_EXEC_CHECK', False):
+                Log(f"[{symbol}] exec-check: pos={current_volume}, single_side={getattr(Config,'SINGLE_SIDE_MODE',True)}, same_side={getattr(Config,'ALLOW_SAME_SIDE_PYRAMIDING',True)}, size_pct={decision.get('position_size_pct')}, tradeability={tradeability_score:.2f}, style={order_price_style}")
         except Exception:
-            mid_px_val = last_price
+            pass
 
         def _choose_price(side):
             # side: 'buy' or 'sell'
@@ -1291,40 +1288,6 @@ class TradeExecutor:
             except Exception:
                 return p
 
-        def _normalize_price(p, tick, fallback):
-            """将价格规范化为交易所精度，避免下单时 Decimal.ConversionSyntax。
-            - p: 原始价格（float/int/str）
-            - tick: 最小变动价位
-            - fallback: 兜底价格（如 last_price）
-            返回 float。
-            """
-            try:
-                from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
-                # 先转float，过滤 None/NaN/Inf
-                try:
-                    pf = float(p)
-                    if not math.isfinite(pf):
-                        pf = float(fallback)
-                except Exception:
-                    pf = float(fallback)
-                tk = float(tick) if tick and tick > 0 else 0.01
-                # 先按方向对齐到tick，再用Decimal按tick精度量化一次
-                q = Decimal(str(pf)).quantize(Decimal(str(tk)), rounding=ROUND_HALF_UP)
-                return float(q)
-            except Exception:
-                # 任意异常回退到 fallback
-                try:
-                    return float(fallback)
-                except Exception:
-                    return 0.0
-
-        # 执行前检查（便于定位静默原因）
-        try:
-            if getattr(Config, 'DEBUG_EXEC_CHECK', False):
-                Log(f"[{symbol}] exec-check: pos={current_volume}, single_side={getattr(Config,'SINGLE_SIDE_MODE',True)}, same_side={getattr(Config,'ALLOW_SAME_SIDE_PYRAMIDING',True)}, size_pct={decision.get('position_size_pct')}, tradeability={tradeability_score:.2f}, style={order_price_style}")
-        except Exception:
-            pass
-
         # 反手/再入场冷却（避免刚止损立刻反向）
         if signal in ('buy', 'sell') and current_volume == 0:
             reentry_until = state.get('reentry_until') if isinstance(state, dict) else None
@@ -1373,6 +1336,7 @@ class TradeExecutor:
                     except Exception:
                         pass
                 return sl_new
+            
 
         # 冷却期内禁止新开仓
         if signal in ('buy', 'sell') and current_volume == 0:
@@ -1400,7 +1364,25 @@ class TradeExecutor:
             except Exception:
                 pass
 
-        # 同向加仓（多）：按目标仓位差额加仓
+        def _normalize_price(p, tick, fallback):
+            try:
+                from decimal import Decimal, ROUND_HALF_UP
+                try:
+                    pf = float(p)
+                    if not math.isfinite(pf):
+                        pf = float(fallback)
+                except Exception:
+                    pf = float(fallback)
+                tk = float(tick_size) if tick_size and tick_size > 0 else 0.01
+                q = Decimal(str(pf)).quantize(Decimal(str(tk)), rounding=ROUND_HALF_UP)
+                return float(q)
+            except Exception:
+                try:
+                    return float(fallback)
+                except Exception:
+                    return 0.0
+
+        # 同向加仓（多）
         if getattr(Config, 'ALLOW_SAME_SIDE_PYRAMIDING', True) and signal == 'buy' and current_volume > 0:
             position_size = _adjust_position_size(decision.get('position_size_pct', 0.5))
             if position_size <= 0:
@@ -1424,7 +1406,6 @@ class TradeExecutor:
             if volume <= 0:
                 Log(f"[{symbol}] 同向加仓: 已达到目标仓(当前={current_lots}, 目标={target_lots})，忽略")
                 return
-
             margin_post = used_margin + volume * margin_per_lot
             guarantee_ratio = (equity / margin_post) if margin_post > 0 else 999
             min_gr = float(Config.MIN_GUARANTEE_RATIO)
@@ -1437,7 +1418,7 @@ class TradeExecutor:
             Log(f"[{symbol}] 加仓规模: equity={equity:.0f}, available={available:.0f}, notional/lot={notional_per_lot:.0f}, margin/lot={margin_per_lot:.0f}, max_lots={max_lots_by_margin}; used_margin→{margin_post:.0f}, 担保比={guarantee_ratio:.2f}")
             return
 
-        # 同向加仓（空）：按目标仓位差额加仓
+        # 同向加仓（空）
         if getattr(Config, 'ALLOW_SAME_SIDE_PYRAMIDING', True) and signal == 'sell' and current_volume < 0:
             position_size = _adjust_position_size(decision.get('position_size_pct', 0.5))
             if position_size <= 0:
@@ -1461,7 +1442,6 @@ class TradeExecutor:
             if volume <= 0:
                 Log(f"[{symbol}] 同向加仓: 已达到目标仓(当前={current_lots}, 目标={target_lots})，忽略")
                 return
-
             margin_post = used_margin + volume * margin_per_lot
             guarantee_ratio = (equity / margin_post) if margin_post > 0 else 999
             min_gr = float(Config.MIN_GUARANTEE_RATIO)
@@ -1515,7 +1495,6 @@ class TradeExecutor:
                 if guarantee_ratio < min_gr:
                     Log(f"[{symbol}] 担保比不足({guarantee_ratio:.2f} < {min_gr:.2f}), 拒绝新仓")
                     return
-
                 # 止损护栏与复位（方向正确+最小间距），基于实际下单价
                 try:
                     md_for_sl = state.get('last_market_data') if isinstance(state, dict) else None
@@ -1640,7 +1619,6 @@ class TradeExecutor:
                 if guarantee_ratio < min_gr:
                     Log(f"[{symbol}] 担保比不足({guarantee_ratio:.2f} < {min_gr:.2f}), 拒绝新仓")
                     return
-
                 # 止损护栏与复位（方向正确+最小间距），基于实际下单价
                 try:
                     md_for_sl = state.get('last_market_data') if isinstance(state, dict) else None
@@ -2134,10 +2112,12 @@ class RiskController:
                     # 初始化基准手数
                     if plan.get('init_volume') in (None, 0):
                         try:
-                            plan['init_volume'] = abs(int(local_get_pos(context, symbol, state)))
+                            try:
+                                plan['init_volume'] = abs(int(local_get_pos(context, symbol, state)))
+                            except Exception:
+                                plan['init_volume'] = plan.get('init_volume') or None
                         except Exception:
-                            # 退化：使用当前持仓或保持原值
-                            plan['init_volume'] = plan.get('init_volume') or abs(position_volume)
+                            plan['init_volume'] = abs(position_volume)
                         # 基于初始持仓计算各档手数
                         base = int(plan['init_volume'] or 0)
                         if base > 0:
@@ -2286,6 +2266,11 @@ def on_init(context):
             Log(f"[AI] DeepSeek Key池已就绪: {context.key_pool.size()} 个Key")
         except Exception:
             context.key_pool = APIKeyPool([getattr(Config, 'DEEPSEEK_API_KEY', '')])
+        # 订单累计成交量跟踪
+        try:
+            context.order_traded_map = {}
+        except Exception:
+            context.order_traded_map = {}
 
         # 载入热参数（context.params 可覆盖默认）
         # 移除动态参数加载，改为使用 Config 中的固定常量
@@ -2353,11 +2338,6 @@ def on_init(context):
                 context.trades_by_symbol[sym] = _dq(maxlen=50)
         except Exception:
             context.trades_by_symbol = {sym: [] for sym in context.symbols}
-        # 订单累计成交量跟踪（避免 on_trade / on_order 重复累加）
-        try:
-            context.order_traded_map = {}
-        except Exception:
-            context.order_traded_map = {}
 
         # 读取 _G 轻持久化的持仓快照（均价/已实盈亏/追踪参数）（可选）
         for sym in context.symbols:
@@ -2395,25 +2375,6 @@ def on_init(context):
         try:
             print('[INIT] on_init finished')
             Log('[INIT] 初始化完成，已订阅行情')
-        except Exception:
-            pass
-
-        # 启动一次性：平台持仓对齐到本地视图（仅数量），避免重启后短窗不一致
-        try:
-            if getattr(Config, 'ALIGN_POS_ON_INIT', True):
-                for sym in context.symbols:
-                    try:
-                        p = int(get_pos(sym))
-                    except Exception:
-                        p = 0
-                    try:
-                        st = context.state.get(sym, {})
-                        st['local_pos'] = int(p)
-                        context.state[sym] = st
-                        if p != 0:
-                            Log(f"[{sym}] [对齐] 启动对齐平台持仓: {p}")
-                    except Exception:
-                        pass
         except Exception:
             pass
     except Exception as e:
@@ -2503,7 +2464,6 @@ def on_start(context):
                 d = base_dt.date()
                 if base_dt.time() >= datetime_time(roll_h, 0, 0):
                     d = d + timedelta(days=1)
-                # 跳过周末
                 while d.weekday() >= 5:
                     d = d + timedelta(days=1)
                 return d
@@ -2534,21 +2494,21 @@ def on_start(context):
                         st['ai_interval_secs'] = adaptive0.get('ai_interval_secs', Config.AI_DECISION_INTERVAL)
                     except Exception:
                         pass
-            # 若已具备快照且未在冷却中，且tick触发被关闭，可在启动时立即触发一次AI后台任务（可配置）
-                md_ready = isinstance(st.get('last_market_data'), dict)
-                allow_tick_ai = bool(getattr(Config, 'ENABLE_TICK_TRIGGERED_AI', False))
-                cooldown_until = st.get('cooldown_until') or 0
-                in_cd = cooldown_until and (time.time() < float(cooldown_until))
-                if getattr(Config, 'ENABLE_STARTUP_AI_TRIGGER', False):
-                    if md_ready and not allow_tick_ai and not in_cd and not st.get('ai_in_flight') and context.trading_allowed:
-                        try:
-                            if _spawn_ai_job(context, sym):
-                                st['last_ai_call_time'] = time.time()
-                                Log(f"[{sym}] 启动阶段已触发AI后台任务")
-                        except Exception:
-                            pass
             except Exception:
                 pass
+            # 若已具备快照且未在冷却中，且tick触发被关闭，可在启动时立即触发一次AI后台任务
+            md_ready = isinstance(st.get('last_market_data'), dict)
+            allow_tick_ai = bool(getattr(Config, 'ENABLE_TICK_TRIGGERED_AI', False))
+            cooldown_until = st.get('cooldown_until') or 0
+            in_cd = cooldown_until and (time.time() < float(cooldown_until))
+            if getattr(Config, 'ENABLE_STARTUP_AI_TRIGGER', False):
+                if md_ready and not allow_tick_ai and not in_cd and not st.get('ai_in_flight') and context.trading_allowed:
+                    try:
+                        if _spawn_ai_job(context, sym):
+                            st['last_ai_call_time'] = time.time()
+                            Log(f"[{sym}] 启动阶段已触发AI后台任务")
+                    except Exception:
+                        pass
         else:
             Log(f"[{sym}] ⏳ 数据暂不充足, 将在运行中继续累积...")
 
@@ -2798,7 +2758,6 @@ def on_tick(context, tick):
         pend_seq = int(state.get('pending_seq') or 0)
         last_seq = int(state.get('last_consumed_seq') or 0)
         if isinstance(pending, dict) and pend_seq > last_seq:
-            # 先占用消费权，避免并发重复
             state['last_consumed_seq'] = pend_seq
             try:
                 Log(f"[{sym}] AI决策: {pending.get('signal')}, 市场状态: {pending.get('market_state')}")
@@ -2820,7 +2779,6 @@ def on_tick(context, tick):
             finally:
                 state['pending_decision'] = None
         elif isinstance(pending, dict) and pend_seq <= last_seq:
-            # 重复结果，丢弃
             state['pending_decision'] = None
     except Exception:
         pass
@@ -2958,7 +2916,6 @@ def on_order_status(context, order):
                     dir_buy = ("买" in _dir_s) or _dir_u.startswith('BUY') or ('LONG' in _dir_u)
                     vol = int(getattr(order, 'volume', 0) or 0)
                     if vol:
-                        # 无论开/平，买方向 +volume，卖方向 -volume（适配期货开平含义）
                         lp = lp + vol if dir_buy else lp - vol
                         st['local_pos'] = lp
                         context.state[sym] = st
@@ -3074,17 +3031,14 @@ def on_order_status(context, order):
 
     
 def on_order(context, order):
-    """订单状态回调（平台可能调用该函数而不是 on_order_status）。
-    依据文档：Status ∈ {SUBMITTING, NOTTRADED, PARTTRADED, ALLTRADED, CANCELLED, REJECTED}
-    使用 order.traded 做增量计算，避免与 on_trade 重复。
-    """
+    """订单状态回调（兼容 on_order）。"""
     try:
         status_raw = str(getattr(order, 'status', '') or '')
         status = status_raw.upper()
         sym = getattr(order, 'symbol', None)
         if not sym:
             return
-        # 归一化 symbol 到 state 键
+        # 归一化 symbol
         try:
             state_map = getattr(context, 'state', {})
             if sym not in state_map:
@@ -3099,13 +3053,11 @@ def on_order(context, order):
         except Exception:
             pass
 
-        # 仅在部分/全部成交时做增量更新
         meaningful = status in ('PARTTRADED', 'ALLTRADED', 'PART TRADED', 'ALL TRADED', '成交', '部分成交', '全部成交')
         if not meaningful:
             return
 
         orderid = getattr(order, 'orderid', None)
-        # 已成交总量（平台字段名可能不同）
         traded_total = None
         for name in ('traded', 'traded_volume', 'filled', 'filled_volume', 'volume_traded'):
             try:
@@ -3116,7 +3068,6 @@ def on_order(context, order):
             except Exception:
                 continue
         if traded_total is None:
-            # 退化：ALLTRADED 用订单数量
             try:
                 if status.startswith('ALL'):
                     traded_total = float(getattr(order, 'volume', 0) or 0)
@@ -3132,13 +3083,11 @@ def on_order(context, order):
         if delta <= 0:
             return
 
-        # 方向归一
         dir_raw = str(getattr(order, 'direction', '') or '')
         _du = dir_raw.upper()
         is_buy = ('买' in dir_raw) or _du.startswith('BUY') or ('LONG' in _du)
         off_raw = str(getattr(order, 'offset', '') or '')
 
-        # 更新本地 pos
         st = context.state.get(sym, {})
         lp = int(st.get('local_pos') or 0)
         lp_before = lp
@@ -3150,7 +3099,6 @@ def on_order(context, order):
         context.state[sym] = st
         context.order_traded_map[orderid] = float(traded_total or 0.0)
 
-        # 更新均价/已实现盈亏（用委托价作为近似）
         try:
             px = float(getattr(order, 'price', 0.0) or 0)
         except Exception:
@@ -3172,12 +3120,10 @@ def on_order(context, order):
 
 
 def on_trade(context, trade):
-    """成交回调：逐笔事实更新本地持仓与均价。"""
     try:
         sym = getattr(trade, 'symbol', None)
         if not sym:
             return
-        # 归一化 symbol
         try:
             state_map = getattr(context, 'state', {})
             if sym not in state_map:
@@ -3191,7 +3137,6 @@ def on_trade(context, trade):
                     sym = resolved
         except Exception:
             pass
-
         dir_raw = str(getattr(trade, 'direction', '') or '')
         _du = dir_raw.upper()
         is_buy = ('买' in dir_raw) or _du.startswith('BUY') or ('LONG' in _du)
@@ -3219,7 +3164,6 @@ def on_trade(context, trade):
                     volume=vol)
             except Exception:
                 pass
-            # 标记到 order_traded_map，避免 on_order 重复累加
             try:
                 if orderid is not None:
                     last = float(context.order_traded_map.get(orderid, 0.0) or 0.0)
@@ -3355,9 +3299,7 @@ def update_pos_snapshot_on_fill(context, symbol, direction, offset, price, volum
             pos_after = int(get_pos(symbol))
         except Exception:
             pos_after = 0
-    _ds = str(direction or '')
-    _du = _ds.upper()
-    side_buy = ("买" in _ds) or _du.startswith('BUY') or ('LONG' in _du)
+    side_buy = ("买" in str(direction)) or (str(direction).lower().startswith('buy'))
     is_open = ("开" in str(offset)) or (str(offset).lower().startswith('open'))
     delta = (volume if side_buy else -volume) if is_open else (0)  # 开仓才改变符号方向
     # 平仓的 delta 不直接使用；用 pos_after 与逻辑推回 pos_before
@@ -3684,6 +3626,15 @@ def collect_market_data(context, symbol, tick, indicators, data_collector, state
     low_20_s = _coerce('low_20', current_price)
     pr_pct_s = _coerce('price_range_pct', 0.0)
 
+    # 数值化以防 None 导致格式化报错
+    def _nf(v, d=0.0):
+        try:
+            return float(v)
+        except Exception:
+            return float(d)
+    bid_price = _nf(bid_price, current_price)
+    ask_price = _nf(ask_price, current_price)
+
     market_data = {
         'account_equity': acc['equity'],
         'account_available': acc['available'],
@@ -3732,8 +3683,7 @@ def collect_market_data(context, symbol, tick, indicators, data_collector, state
         'd_trend': inds.get('d_trend', 'N/A') if inds.get('d_trend') is not None else 'N/A',
         'zigzag_summary': inds.get('zigzag_summary', 'N/A') if inds.get('zigzag_summary') is not None else 'N/A',
         'fib_summary': inds.get('fib_summary', 'N/A') if inds.get('fib_summary') is not None else 'N/A',
-        **inds,  # 原始指标（可能含None）
-        # 用规范化值覆盖，确保提示字符串格式化安全
+        **inds,
         'ema_20': ema_20_s,
         'ema_60': ema_60_s,
         'macd': macd_s,
@@ -3747,3 +3697,125 @@ def collect_market_data(context, symbol, tick, indicators, data_collector, state
     }
 
     return market_data
+
+
+
+# ====== Kimi overlay (single-file) ======
+try:
+    import requests
+except Exception:
+    requests = None
+
+class KimiConfig:
+    BASE_URL = "https://api.moonshot.cn/v1/chat/completions"
+    MODEL = "kimi-k2-turbo-preview"
+    TEMPERATURE = getattr(Config, 'DEEPSEEK_TEMPERATURE', 0.7)
+    MAX_TOKENS = getattr(Config, 'DEEPSEEK_MAX_TOKENS', 2000)
+    API_TIMEOUT = getattr(Config, 'API_TIMEOUT', 30)
+    API_MAX_RETRIES = getattr(Config, 'API_MAX_RETRIES', 3)
+    API_KEYS = [
+        "sk-Bn613HW6cWJQFdv7wIEmP0GjlNJdgloJUL34AmvYFqBuL6EF",
+        "sk-CkIHuWsLYsKE1QOPKuRW0qPmD2BhrYmI2avLDwpau4MT35hY",
+    ]
+
+class AIDecisionEngineKimi:
+    @staticmethod
+    def call_deepseek_api(prompt: str, api_key: str = None):
+        if requests is None:
+            return None, "requests 未安装，跳过Kimi调用"
+        key = api_key or (KimiConfig.API_KEYS[0] if KimiConfig.API_KEYS else "")
+        if not key:
+            return None, "未配置 Kimi API Key"
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {key}',
+        }
+        payload = {
+            'model': KimiConfig.MODEL,
+            'messages': [
+                {'role': 'system', 'content': SYSTEM_PROMPT_WAVE_FIRST},
+                {'role': 'user', 'content': prompt},
+            ],
+            'temperature': KimiConfig.TEMPERATURE,
+            'max_tokens': KimiConfig.MAX_TOKENS,
+        }
+        def _extract_json(txt: str) -> str:
+            t = (txt or '').strip()
+            # 1) 代码块优先
+            if '```json' in t:
+                try:
+                    return t.split('```json', 1)[1].split('```', 1)[0].strip()
+                except Exception:
+                    pass
+            if '```' in t:
+                try:
+                    return t.split('```', 1)[1].split('```', 1)[0].strip()
+                except Exception:
+                    pass
+            # 2) 平衡大括号扫描（提取第一段完整 JSON 对象）
+            i = t.find('{')
+            if i != -1:
+                depth = 0
+                for j, ch in enumerate(t[i:], start=i):
+                    if ch == '{':
+                        depth += 1
+                    elif ch == '}':
+                        depth -= 1
+                        if depth == 0:
+                            return t[i:j+1]
+            return t
+
+        def _clean_json(s: str) -> str:
+            try:
+                import re
+                s2 = re.sub(r",\s*([}\]])", r"\\1", s)  # 去掉尾逗号
+                s2 = s2.replace('None', 'null').replace('True', 'true').replace('False', 'false')
+                return s2
+            except Exception:
+                return s
+
+        for attempt in range(int(KimiConfig.API_MAX_RETRIES)):
+            try:
+                resp = requests.post(
+                    KimiConfig.BASE_URL,
+                    headers=headers,
+                    json=payload,
+                    timeout=KimiConfig.API_TIMEOUT,
+                )
+                if resp.status_code == 200:
+                    result = resp.json()
+                    content = result['choices'][0]['message']['content']
+                    raw = _extract_json(content)
+                    try:
+                        return json.loads(raw), None
+                    except Exception:
+                        try:
+                            return json.loads(_clean_json(raw)), None
+                        except Exception as e:
+                            return None, f"Kimi返回解析失败: {e}"
+                else:
+                    err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                    if attempt < int(KimiConfig.API_MAX_RETRIES) - 1:
+                        time.sleep(2 ** attempt)
+                        continue
+                    return None, err
+            except Exception as e:
+                if attempt < int(KimiConfig.API_MAX_RETRIES) - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                return None, f"Kimi调用异常: {e}"
+        return None, "Kimi调用失败，已达最大重试次数"
+
+_old_on_init = on_init
+
+def on_init(context):
+    _old_on_init(context)
+    try:
+        context.key_pool = APIKeyPool(KimiConfig.API_KEYS)
+        context.ai_engine = AIDecisionEngineKimi()
+        Log(f"[AI] Kimi引擎就绪: {context.key_pool.size()} 个Key, model={KimiConfig.MODEL}")
+    except Exception as e:
+        try:
+            Log(f"[AI] Kimi初始化异常: {e}")
+        except Exception:
+            pass
