@@ -1,21 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-Kimi 版本的自主交易策略入口
+Kimi Chief-Trader 版（AI工程体）入口
 
-做法：复用 gkoudai_au_strategy_autonomous 的全部逻辑，只替换 AI 调用层为 Kimi（Moonshot）API，
-并使用多 Key 轮询 + 错峰触发来避免同刻并发。
+说明：
+- 仅支持 Chief Trader（合同式 System Prompt + 简报），不再兼容旧的波浪提示模式。
+- 运行期仍复用主策略的回调/数据/执行框架，但强制走 Chief Trader 路径。
 """
 
 import json
 import time
 
 try:
-    import requests  # 与主策略保持一致，直接用 REST 调用，避免依赖 openai SDK
+    import requests  # 直接用 REST 调用，避免依赖 openai SDK
 except Exception:
     requests = None
 
 import gkoudai_au_strategy_autonomous as base
-from gkoudai_au_strategy_autonomous import *  # noqa: F401,F403 — 导入回调与辅助函数
+from gkoudai_au_strategy_autonomous import *  # noqa: F401,F403 — 复用回调与工具
 
 
 class KimiConfig:
@@ -25,18 +26,19 @@ class KimiConfig:
     MAX_TOKENS = getattr(base.Config, 'DEEPSEEK_MAX_TOKENS', 2000)
     API_TIMEOUT = getattr(base.Config, 'API_TIMEOUT', 30)
     API_MAX_RETRIES = getattr(base.Config, 'API_MAX_RETRIES', 3)
-    # 多Key（你提供的两把）
+    # 建议使用你自己的Key池
     API_KEYS = [
-        "sk-Bn613HW6cWJQFdv7wIEmP0GjlNJdgloJUL34AmvYFqBuL6EF",
-        "sk-CkIHuWsLYsKE1QOPKuRW0qPmD2BhrYmI2avLDwpau4MT35hY",
+        # TODO: 替换为你的Kimi Key（支持多Key轮询）
+        "sk-REPLACE_ME_1",
+        "sk-REPLACE_ME_2",
     ]
 
 
-class AIDecisionEngineKimi:
-    """与主策略的 AIDecisionEngine 接口保持一致，方法名仍叫 call_deepseek_api。"""
+class AIDecisionEngineKimiChief:
+    """Chief Trader 模式的Kimi调用：只使用合同式system，不再保留旧提示。"""
 
     @staticmethod
-    def call_deepseek_api(prompt: str, api_key: str = None):  # 兼容主策略签名
+    def call_llm(prompt: str, api_key: str = None):  # 新签名
         if requests is None:
             return None, "requests 未安装，跳过Kimi调用"
 
@@ -48,13 +50,11 @@ class AIDecisionEngineKimi:
             'Content-Type': 'application/json',
             'Authorization': f'Bearer {key}',
         }
-        # 按主策略开关选择合同式(Chief Trader)或波浪提示词
-        use_chief = bool(getattr(base.Config, 'USE_CHIEF_TRADER', False))
-        sys_prompt = base.SYSTEM_PROMPT_CHIEF_TRADER if use_chief else base.SYSTEM_PROMPT_WAVE_FIRST
         payload = {
             'model': KimiConfig.MODEL,
             'messages': [
-                {'role': 'system', 'content': sys_prompt},
+                {'role': 'system', 'content': base.SYSTEM_PROMPT_CHIEF_TRADER},
+                # prompt 应该是 build_briefing(context, symbol, state) 生成的JSON字符串
                 {'role': 'user', 'content': prompt},
             ],
             'temperature': KimiConfig.TEMPERATURE,
@@ -72,10 +72,9 @@ class AIDecisionEngineKimi:
                 if resp.status_code == 200:
                     result = resp.json()
                     content = result['choices'][0]['message']['content']
-                    # 容错提取 JSON
+                    # 提取JSON
                     def _extract_json(txt: str) -> str:
                         t = txt.strip()
-                        # 1) 代码块
                         if '```json' in t:
                             try:
                                 return t.split('```json', 1)[1].split('```', 1)[0].strip()
@@ -86,35 +85,29 @@ class AIDecisionEngineKimi:
                                 return t.split('```', 1)[1].split('```', 1)[0].strip()
                             except Exception:
                                 pass
-                        # 2) 第一个大括号起、到匹配的右括号
-                        start = t.find('{')
-                        if start >= 0:
-                            # 简单栈匹配
+                        st = t.find('{')
+                        if st >= 0:
                             depth = 0
-                            for i in range(start, len(t)):
+                            for i in range(st, len(t)):
                                 ch = t[i]
                                 if ch == '{':
                                     depth += 1
                                 elif ch == '}':
                                     depth -= 1
                                     if depth == 0:
-                                        return t[start:i+1]
+                                        return t[st:i+1]
                         return t
                     raw = _extract_json(content)
                     def _clean_json(s: str) -> str:
-                        # 去掉对象/数组中的尾逗号
                         import re
                         s2 = re.sub(r",\s*([}\]])", r"\1", s)
-                        # 替换 Python 布尔/空为 JSON
-                        s2 = s2.replace('None', 'null').replace('True', 'true').replace('False', 'false')
-                        return s2
+                        return s2.replace('None', 'null').replace('True', 'true').replace('False', 'false')
                     try:
                         return json.loads(raw), None
                     except Exception:
                         try:
                             return json.loads(_clean_json(raw)), None
                         except Exception as e:
-                            # 截断错误内容长度，避免日志爆量
                             return None, f"Kimi返回解析失败: {e}"
                 else:
                     err = f"HTTP {resp.status_code}: {resp.text[:200]}"
@@ -132,20 +125,29 @@ class AIDecisionEngineKimi:
 
 
 def on_init(context):
-    """覆盖 on_init：先执行主策略初始化，再替换 AI 引擎与 Key 池。"""
+    """先运行主策略初始化，再强制切Chief Trader路径并替换成Kimi引擎。"""
     base.on_init(context)
-
     try:
-        # 用Kimi的多Key池替换主策略的Key池（沿用主策略的APIKeyPool实现）
+        # 强制走 Chief Trader
+        try:
+            base.Config.USE_CHIEF_TRADER = True
+        except Exception:
+            pass
+        # 替换 Key 池与引擎
         context.key_pool = base.APIKeyPool(KimiConfig.API_KEYS)
-        # 替换为Kimi引擎
-        context.ai_engine = AIDecisionEngineKimi()
-        Log(f"[AI] Kimi引擎就绪: {context.key_pool.size()} 个Key, model={KimiConfig.MODEL}")
+        # 适配主策略的调用点：call_deepseek_api(prompt, api_key)
+        class _Adapter:
+            @staticmethod
+            def call_deepseek_api(prompt: str, api_key: str = None):
+                return AIDecisionEngineKimiChief.call_llm(prompt, api_key=api_key)
+        context.ai_engine = _Adapter()
+        Log(f"[AI] Kimi ChiefTrader 就绪: keys={context.key_pool.size()}, model={KimiConfig.MODEL}")
     except Exception as e:
         try:
-            Log(f"[AI] Kimi初始化异常: {e}")
+            Log(f"[AI] Kimi ChiefTrader 初始化异常: {e}")
         except Exception:
             pass
 
 
-# 其余回调（on_start/on_tick/...）直接复用主策略的实现
+# 其余回调（on_start/on_tick/on_bar/...）复用主策略实现。
+

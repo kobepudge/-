@@ -30,6 +30,7 @@ import traceback
 from collections import deque
  
 import math
+import statistics
 
 # ---- Heartbeat: module imported ----
 try:
@@ -78,7 +79,7 @@ class Config:
     DEEPSEEK_MAX_TOKENS = 2000
 
     # AI决策频率 (秒) - 平衡成本和响应速度
-    AI_DECISION_INTERVAL = 60  # 1分钟一次决策
+    AI_DECISION_INTERVAL = 180  # 降频：默认3分钟一次决策
     # 多标的错峰触发的最大抖动秒数（每个标的固定随机相位，避免同刻并发）
     AI_STAGGER_MAX_SECS = 7
 
@@ -120,9 +121,13 @@ class Config:
     # 触发AI所需的最小tick数（避免刚启动时过严）；原固定20调整为可配置，默认5
     TICKS_MIN_FOR_AI = 5
     # 触发AI所需的最少1m K线根数（确保不是纯tick噪音）
-    MIN_1M_BARS_FOR_AI = 10
+    MIN_1M_BARS_FOR_AI = 20
     # 是否允许在on_tick上触发AI（否则仅在on_bar节拍触发）
     ENABLE_TICK_TRIGGERED_AI = False
+
+    # 是否使用 on_order 回调来驱动成交填充（更新本地持仓与均价）。
+    # 大多数平台会提供 on_trade 逐笔成交回调；为避免与 on_order 重复累加，默认关闭。
+    USE_ON_ORDER_FOR_FILLS = False
 
     # API重试配置
     API_TIMEOUT = 30  # 增加到30秒,避免网络波动导致超时
@@ -131,24 +136,24 @@ class Config:
     # 自适应与动态管理
     ADAPTIVE_PARAMS = {
         'UPTREND': {
-            'ai_interval_secs': 60,
-            'cooldown_minutes': 2,
+            'ai_interval_secs': 180,
+            'cooldown_minutes': 5,
             'position_size_pct': 0.6,
             'trailing_type': 'atr',
             'trailing_atr_mult': 2.0,
             'trailing_percent': 0.0,
         },
         'DOWNTREND': {
-            'ai_interval_secs': 60,
-            'cooldown_minutes': 2,
+            'ai_interval_secs': 180,
+            'cooldown_minutes': 5,
             'position_size_pct': 0.6,
             'trailing_type': 'atr',
             'trailing_atr_mult': 2.0,
             'trailing_percent': 0.0,
         },
         'SIDEWAYS': {
-            'ai_interval_secs': 60,
-            'cooldown_minutes': 3,
+            'ai_interval_secs': 240,
+            'cooldown_minutes': 10,
             'position_size_pct': 0.3,
             'trailing_type': 'percent',
             'trailing_atr_mult': 0.0,
@@ -163,11 +168,13 @@ class Config:
 
     # 兜底保证金率（若平台未提供合约保证金率字段时使用; 数值需按交易所校准）
     DEFAULT_MARGIN_RATIO_LONG = {
-        "au2512.SHFE": 0.07,
+        # 上期所AU合约按平台实际占用核验：~14%
+        "au2512.SHFE": 0.14,
         "lc2601.GFEX": 0.12,
     }
     DEFAULT_MARGIN_RATIO_SHORT = {
-        "au2512.SHFE": 0.07,
+        # 上期所AU合约按平台实际占用核验：~14%
+        "au2512.SHFE": 0.14,
         "lc2601.GFEX": 0.12,
     }
 
@@ -176,11 +183,20 @@ class Config:
     # 最低担保比（equity / margin_used，越高越安全）；若低于该值则禁止新开仓
     MIN_GUARANTEE_RATIO = 1.3
 
-    # 入场止损护栏（方向+最小间距）
-    MIN_STOP_TICKS = 5
-    MIN_STOP_ATR_MULT = 0.25
+    # 入场止损护栏（方向+最小间距）——为降低噪音止损，略放宽
+    MIN_STOP_TICKS = 10
+    MIN_STOP_ATR_MULT = 0.4
     # 反手/再入场冷却（秒）
     REENTRY_COOLDOWN_SECS = 120
+
+    # 低换手/反趋势风控（执行器硬门槛）
+    LOW_CHURN_MODE = True
+    TREND_MIN_RRR = 2.0          # 顺势最小RRR
+    CT_MIN_CONF = 0.70           # 反趋势最小信心
+    CT_MIN_RRR = 2.5             # 反趋势最小RRR
+    CT_MIN_EDGE = 0.0            # 反趋势最小edge_over_friction（若AI提供）
+    CT_MAX_PCT = 0.15            # 反趋势最大仓位占比
+    CT_COOLDOWN_MIN = 10         # 反趋势成交后的最小冷却（分钟）
 
     # 波浪/结构识别参数（ZigZag）默认值
     # 可被热参数覆盖：zigzag_threshold_pct
@@ -193,6 +209,16 @@ class Config:
     LOG_FULL_AI_REASONING = False
     # 打印AI完整JSON决策（可能较长）
     LOG_FULL_AI_JSON = False
+
+
+# 交易员手册（Rulebook）— 作为System Prompt的“公司制度”与执行器熔断的基准
+TRADER_RULEBOOK = {
+    "max_position_pct": 0.6,                        # 账户权益的最大仓位占比
+    "mandatory_stop_loss": True,                    # 每笔必须有止损
+    "no_overnight": "14:55:00",                    # 最终平仓时间
+    "max_daily_loss_pct": 0.05,                     # 单日最大亏损
+    "min_reward_risk_ratio": 2.0                    # 最小可接受的RRR（顺势）；反趋势由执行器更高门槛约束
+}
 
 
 
@@ -213,7 +239,8 @@ SYSTEM_PROMPT_WAVE_FIRST = (
     "\n   - 若小级别顺大级别主升/主跌(IMPULSE同向)：允许更宽目标位/分批止盈在更远R倍数。"
     "\n   - 若小级别为大级别回撤/修正：采用更保守止盈(更近的R倍数/更高比例的早期减仓)。"
     "\n   - 若处于中枢震荡(CHAN_CENTER)：小仓位、快进快出、时间止盈优先。"
-    "\n6) 交易历史仅用于错误避免，不得因短期盈亏放大/缩小仓位。"
+    "\n6) 少做反趋势：若与5m/日线趋势相反，仅在出现强证据（有效突破+回踩确认/背离+放量等）且胜率显著时才可交易；默认小仓位。"
+    "\n7) 交易历史仅用于错误避免，不得因短期盈亏放大/缩小仓位。"
 )
 
 def construct_autonomous_trading_prompt(market_data):
@@ -271,6 +298,11 @@ def construct_autonomous_trading_prompt(market_data):
 - **L5不平衡**: {market_data['imbalance_l5']:.2f}
 - **五档买深度/卖深度**: {market_data['sum_bid_5']} / {market_data['sum_ask_5']}
 - **流动性评分**: {market_data['liquidity_score']:.2f} ({market_data['liquidity_state']})
+
+## 订单流摘要（近tick窗口）
+- **Delta(20t)**: {market_data.get('of_delta_20', 0.0):.0f}
+- **DeltaMA(5/10)**: {market_data.get('of_ma5', 0.0):.1f} / {market_data.get('of_ma10', 0.0):.1f}
+- **Delta Z-Score(50)**: {market_data.get('of_z50', 0.0):.2f}
 
 ## 技术指标 (1分钟周期 - 入场分析)
 - **EMA20**: {market_data['ema_20']:.2f}
@@ -426,6 +458,9 @@ def construct_autonomous_trading_prompt(market_data):
   "reasoning": "你的完整分析思路,包括: 1)量价与盘口 2)趋势结构 3)关键技术位 4)风险与可交易性",
   "signal": "buy|sell|hold|close|adjust_stop",
   "confidence": 0.75,
+  "trend_alignment": "aligned|opposite|neutral",  // 与5m/日线方向是否一致
+  "countertrend": false,                           // 若为反趋势请置true并给出证据
+  "edge_over_friction": 0.2,                       // 期望优势-摩擦(>0才值得做)
 
   // 入场与目标（若 signal 为 buy/sell 建议给出）
   "entry_price": 550.50,
@@ -452,6 +487,7 @@ def construct_autonomous_trading_prompt(market_data):
   "scale_out_pcts": [0.33, 0.33, 0.34],
   "time_stop_minutes": 0,
   "cooldown_minutes": 0,
+  "min_interval_minutes": 10,
 
   // 波浪/结构（可选）
   "wave_primary": "Minor Impulse: now in 3",
@@ -504,6 +540,21 @@ class MarketDataCollector:
         self.kline_1m_buffer = []
         self.kline_1d_buffer = []
         self.depth5_buffer = deque(maxlen=Config.DEPTH_LIQ_WINDOW)
+        # 订单流聚合（简版）
+        from collections import deque as _dq
+        self._of_last_price = None
+        self._of_delta_win = _dq(maxlen=120)
+        self._of_cum = 0.0
+        # 每bar汇总
+        self._bar_levels = {}
+        self._bar_delta = 0.0
+
+    def _bucket_price(self, p, tick):
+        try:
+            t = float(tick) if tick and tick > 0 else 0.01
+            return round(float(p) / t) * t
+        except Exception:
+            return float(p)
 
     def add_tick(self, tick):
         """添加tick数据"""
@@ -573,6 +624,32 @@ class MarketDataCollector:
         if depth5 > 0:
             self.depth5_buffer.append(depth5)
 
+        # 订单流delta：按价格变动方向近似判定主动性；持平时用L1不平衡方向
+        try:
+            _lp = self._of_last_price
+            _price_now = float(price)
+            if _lp is None:
+                sign = 0
+            else:
+                if _price_now > _lp:
+                    sign = 1
+                elif _price_now < _lp:
+                    sign = -1
+                else:
+                    try:
+                        sign = 1 if float(bid_vol or 0) > float(ask_vol or 0) else (-1 if float(ask_vol or 0) > float(bid_vol or 0) else 0)
+                    except Exception:
+                        sign = 0
+            self._of_last_price = _price_now
+            vol_tick = float(volume or 0)
+            if vol_tick < 0:
+                vol_tick = 0.0
+            delta = sign * vol_tick
+            self._of_cum += delta
+            self._of_delta_win.append(delta)
+        except Exception:
+            pass
+
         self.tick_buffer.append({
             'price': price,
             'volume': volume,
@@ -584,6 +661,56 @@ class MarketDataCollector:
             'spread': spread,
             'depth5': depth5
         })
+
+        # 记录到当前bar临时聚合（用于价位簇）
+        try:
+            sign_lvl = 0
+            if self._of_last_price is None:
+                sign_lvl = 0
+            else:
+                if float(price) > float(self._of_last_price):
+                    sign_lvl = 1
+                elif float(price) < float(self._of_last_price):
+                    sign_lvl = -1
+                else:
+                    sign_lvl = 1 if float(bid_vol or 0) > float(ask_vol or 0) else (-1 if float(ask_vol or 0) > float(bid_vol or 0) else 0)
+            vol_tick = float(volume or 0.0)
+            self._bar_delta += sign_lvl * max(0.0, vol_tick)
+        except Exception:
+            pass
+
+    def finalize_orderflow_bar(self, tick_size=None, topN=10):
+        """将最近一个bar内累积的tick按价位聚合为delta分布，生成顶级价位簇与bar_delta。"""
+        try:
+            t = float(tick_size) if tick_size and tick_size > 0 else 0.01
+        except Exception:
+            t = 0.01
+        levels = {}
+        # 使用最近约一分钟的tick窗口（粗略：取最后60个）
+        recent = list(self.tick_buffer)[-60:]
+        last_px = None
+        for tk in recent:
+            px = float(tk.get('price', 0.0) or 0.0)
+            vol = float(tk.get('volume', 0.0) or 0.0)
+            bidv = float(tk.get('bid_vol', 0.0) or 0.0)
+            askv = float(tk.get('ask_vol', 0.0) or 0.0)
+            if last_px is None:
+                last_px = px
+            sign = 1 if px > last_px else (-1 if px < last_px else (1 if bidv > askv else (-1 if askv > bidv else 0)))
+            bucket = self._bucket_price(px, t)
+            levels[bucket] = levels.get(bucket, 0.0) + sign * max(0.0, vol)
+            last_px = px
+        # 排序并截断
+        items = sorted(levels.items(), key=lambda kv: abs(kv[1]), reverse=True)
+        top = items[:max(1, int(topN))]
+        # bar_delta 使用窗口delta估算
+        bar_delta = sum([v for _, v in levels.items()]) if levels else float(self._bar_delta)
+        # 清零bar累积量（下个bar重新累积）
+        self._bar_delta = 0.0
+        return {
+            'bar_delta': float(bar_delta),
+            'price_levels': [{'price': float(k), 'delta': float(v)} for k, v in top]
+        }
 
     def update_klines(self, symbol):
         """更新K线数据"""
@@ -1050,17 +1177,14 @@ class AIDecisionEngine:
             'Authorization': f'Bearer {key}'
         }
 
+        # 仅使用波浪优先的系统提示
+        sys_prompt = SYSTEM_PROMPT_WAVE_FIRST
+        user_content = prompt
         payload = {
             'model': Config.DEEPSEEK_MODEL,
             'messages': [
-                {
-                    'role': 'system',
-                    'content': SYSTEM_PROMPT_WAVE_FIRST
-                },
-                {
-                    'role': 'user',
-                    'content': prompt
-                }
+                {'role': 'system', 'content': sys_prompt},
+                {'role': 'user', 'content': user_content}
             ],
             'temperature': Config.DEEPSEEK_TEMPERATURE,
             'max_tokens': Config.DEEPSEEK_MAX_TOKENS
@@ -1142,6 +1266,38 @@ class TradeExecutor:
         signal = decision.get('signal', 'hold')
         confidence = float(decision.get('confidence', 0) or 0)
 
+        # 执行前熔断检查（基础理智校验）
+        def _is_ai_insane(decision_obj, md_obj):
+            try:
+                sig = str(decision_obj.get('signal', 'hold') or 'hold').lower()
+                if sig not in ('buy', 'sell', 'close', 'hold'):
+                    return True, f"未知signal={sig}"
+                if sig in ('buy', 'sell') and TRADER_RULEBOOK.get('mandatory_stop_loss', True):
+                    _sl = decision_obj.get('stop_loss', None)
+                    try:
+                        _ = float(_sl)
+                    except Exception:
+                        return True, "新仓未提供有效止损"
+                ps = float(decision_obj.get('position_size_pct', 0) or 0)
+                if ps > float(TRADER_RULEBOOK.get('max_position_pct', 0.6)):
+                    decision_obj['position_size_pct'] = float(TRADER_RULEBOOK.get('max_position_pct', 0.6))
+                try:
+                    rrr = float(decision_obj.get('risk_reward_ratio', 0) or 0)
+                    dtrend = str((md_obj or {}).get('d_trend') or 'SIDEWAYS').upper()
+                    is_counter = ((dtrend == 'UPTREND' and sig == 'sell') or (dtrend == 'DOWNTREND' and sig == 'buy'))
+                    if not is_counter and rrr and rrr < float(TRADER_RULEBOOK.get('min_reward_risk_ratio', 2.0)):
+                        return True, f"顺势RRR不足({rrr:.2f}<{float(TRADER_RULEBOOK.get('min_reward_risk_ratio', 2.0)):.2f})"
+                except Exception:
+                    pass
+                return False, "OK"
+            except Exception as _e:
+                return False, f"检查异常({_e})"
+
+        insane, why = _is_ai_insane(decision, state.get('last_market_data') if isinstance(state, dict) else None)
+        if insane:
+            Log(f"[{symbol}] 执行熔断: {why}")
+            return
+
         # 信心度检查（热参数）
         min_conf = float(Config.MIN_AI_CONFIDENCE)
         if confidence < min_conf:
@@ -1159,6 +1315,17 @@ class TradeExecutor:
             except Exception:
                 Log(f"[{symbol}] [警告] 止损格式无效({repr(_sl)}), 拒绝新仓")
                 return
+            # 止损方向硬校验（额外提示）
+            try:
+                last_px_tmp = float(getattr(tick, 'last_price', getattr(tick, 'price', 0)) or 0)
+                if signal == 'buy' and _sl_v >= last_px_tmp:
+                    Log(f"[{symbol}] [熔断提示] 做多止损价({float(_sl_v):.2f})高于/等于当前价({last_px_tmp:.2f})，拒绝新仓")
+                    return
+                if signal == 'sell' and _sl_v <= last_px_tmp:
+                    Log(f"[{symbol}] [熔断提示] 做空止损价({float(_sl_v):.2f})低于/等于当前价({last_px_tmp:.2f})，拒绝新仓")
+                    return
+            except Exception:
+                pass
 
         # 获取当前持仓（优先运行期本地值；退化到平台）
         current_volume = local_get_pos(context, symbol, state)
@@ -1191,6 +1358,19 @@ class TradeExecutor:
         order_price_style = str(decision.get('order_price_style', 'best')).lower()
         tradeability_score = float(decision.get('tradeability_score', 1.0))
         cooldown_minutes = float(decision.get('cooldown_minutes', 0) or 0)
+        # plan_id 透传保存
+        plan_id = decision.get('plan_id')
+        # AI提供的最小间隔（分钟）→ 作为pending冷却的下限
+        try:
+            ai_min_iv = float(decision.get('min_interval_minutes', 0) or 0)
+            if ai_min_iv > 0:
+                try:
+                    st_cd = float(state.get('pending_cooldown_minutes') or 0)
+                except Exception:
+                    st_cd = 0.0
+                state['pending_cooldown_minutes'] = max(st_cd, ai_min_iv)
+        except Exception:
+            pass
         # 动态止盈相关（交由AI管理）
         trailing_type = str(decision.get('trailing_type', 'none') or 'none').lower()
         trailing_atr_mult = float(decision.get('trailing_atr_mult', 0) or 0)
@@ -1224,6 +1404,49 @@ class TradeExecutor:
         except Exception:
             mid_px_val = last_price
 
+        # 低换手/反趋势硬门槛
+        try:
+            if getattr(Config, 'LOW_CHURN_MODE', False) and signal in ('buy', 'sell'):
+                trend_daily = str((md.get('d_trend') if isinstance(md, dict) else 'SIDEWAYS') or 'SIDEWAYS').upper()
+                is_counter = ((trend_daily == 'UPTREND' and signal == 'sell') or (trend_daily == 'DOWNTREND' and signal == 'buy'))
+                rrr = float(decision.get('risk_reward_ratio', 0) or 0)
+                edge = decision.get('edge_over_friction', None)
+
+                if is_counter:
+                    reasons = []
+                    if confidence < float(getattr(Config, 'CT_MIN_CONF', 0.7)):
+                        reasons.append(f"conf {confidence:.2f}<{getattr(Config,'CT_MIN_CONF',0.7):.2f}")
+                    if rrr < float(getattr(Config, 'CT_MIN_RRR', 2.5)):
+                        reasons.append(f"RRR {rrr:.2f}<{getattr(Config,'CT_MIN_RRR',2.5):.2f}")
+                    try:
+                        if edge is not None and float(edge) <= float(getattr(Config, 'CT_MIN_EDGE', 0.0)):
+                            reasons.append(f"edge {float(edge):.2f}<=CT_MIN_EDGE")
+                    except Exception:
+                        pass
+                    if reasons:
+                        Log(f"[{symbol}] 反趋势门槛未过({trend_daily} vs {signal}): {', '.join(reasons)}，忽略新仓")
+                        return
+                    # 缩仓与冷却
+                    ps = float(decision.get('position_size_pct', 0.5) or 0.5)
+                    max_pct = float(getattr(Config, 'CT_MAX_PCT', 0.15))
+                    if ps > max_pct:
+                        decision['position_size_pct'] = max_pct
+                    cd_min = float(getattr(Config, 'CT_COOLDOWN_MIN', 10))
+                    try:
+                        st_cd = float(state.get('pending_cooldown_minutes') or 0)
+                    except Exception:
+                        st_cd = 0
+                    state['pending_cooldown_minutes'] = max(st_cd, cd_min)
+                    Log(f"[{symbol}] 反趋势单确认: 缩仓至{decision.get('position_size_pct')}, 冷却≥{int(cd_min)}min, RRR={rrr:.2f}, conf={confidence:.2f}")
+                else:
+                    # 顺势最小RRR
+                    min_rrr = float(getattr(Config, 'TREND_MIN_RRR', 2.0))
+                    if rrr and rrr < min_rrr:
+                        Log(f"[{symbol}] 顺势RRR不足({rrr:.2f}<{min_rrr:.2f})，忽略新仓")
+                        return
+        except Exception:
+            pass
+
         def _choose_price(side):
             # side: 'buy' or 'sell'
             if order_price_style == 'mid' and mid_px_val:
@@ -1252,6 +1475,8 @@ class TradeExecutor:
                 spread_limit = float(Config.SPREAD_RATIO_LIMIT)
                 if (spread_val / mid_px_val) > spread_limit:
                     pct = min(pct, 0.3)
+            # 公司级上限
+            pct = min(pct, float(TRADER_RULEBOOK.get('max_position_pct', 0.6)))
             return pct
 
         # 账户与合约参数 -- 用真实数据替代固定值
@@ -1434,7 +1659,13 @@ class TradeExecutor:
 
             buy(symbol, order_price, volume)
             Log(f"[{symbol}] 同向加仓: 加多 {volume}手 @ {order_price:.2f}，当前={current_lots}→目标={target_lots}，信心度={confidence:.2f}")
-            Log(f"[{symbol}] 加仓规模: equity={equity:.0f}, available={available:.0f}, notional/lot={notional_per_lot:.0f}, margin/lot={margin_per_lot:.0f}, max_lots={max_lots_by_margin}; used_margin→{margin_post:.0f}, 担保比={guarantee_ratio:.2f}")
+            try:
+                src_l = PlatformAdapter.get_margin_ratio_source(symbol, 'long')
+                tick_dbg = PlatformAdapter.get_pricetick(symbol) or 0
+                minv_dbg = PlatformAdapter.get_min_volume(symbol)
+                Log(f"[{symbol}] 加仓规模: equity={equity:.0f}, available={available:.0f}, notional/lot={notional_per_lot:.0f}, margin/lot={margin_per_lot:.0f}, max_lots={max_lots_by_margin}; used_margin→{margin_post:.0f}, 担保比={guarantee_ratio:.2f} | 合约: size={mult}, tick={tick_dbg}, min={minv_dbg}, m_long={long_mr:.4f}({src_l})")
+            except Exception:
+                Log(f"[{symbol}] 加仓规模: equity={equity:.0f}, available={available:.0f}, notional/lot={notional_per_lot:.0f}, margin/lot={margin_per_lot:.0f}, max_lots={max_lots_by_margin}; used_margin→{margin_post:.0f}, 担保比={guarantee_ratio:.2f}")
             return
 
         # 同向加仓（空）：按目标仓位差额加仓
@@ -1471,7 +1702,13 @@ class TradeExecutor:
 
             short(symbol, order_price, volume)
             Log(f"[{symbol}] 同向加仓: 加空 {volume}手 @ {order_price:.2f}，当前={current_lots}→目标={target_lots}，信心度={confidence:.2f}")
-            Log(f"[{symbol}] 加仓规模: equity={equity:.0f}, available={available:.0f}, notional/lot={notional_per_lot:.0f}, margin/lot={margin_per_lot:.0f}, max_lots={max_lots_by_margin}; used_margin→{margin_post:.0f}, 担保比={guarantee_ratio:.2f}")
+            try:
+                src_s = PlatformAdapter.get_margin_ratio_source(symbol, 'short')
+                tick_dbg = PlatformAdapter.get_pricetick(symbol) or 0
+                minv_dbg = PlatformAdapter.get_min_volume(symbol)
+                Log(f"[{symbol}] 加仓规模: equity={equity:.0f}, available={available:.0f}, notional/lot={notional_per_lot:.0f}, margin/lot={margin_per_lot:.0f}, max_lots={max_lots_by_margin}; used_margin→{margin_post:.0f}, 担保比={guarantee_ratio:.2f} | 合约: size={mult}, tick={tick_dbg}, min={minv_dbg}, m_short={short_mr:.4f}({src_s})")
+            except Exception:
+                Log(f"[{symbol}] 加仓规模: equity={equity:.0f}, available={available:.0f}, notional/lot={notional_per_lot:.0f}, margin/lot={margin_per_lot:.0f}, max_lots={max_lots_by_margin}; used_margin→{margin_post:.0f}, 担保比={guarantee_ratio:.2f}")
             return
 
         if signal == 'buy' and current_volume == 0:
@@ -1533,6 +1770,12 @@ class TradeExecutor:
                 Log(f"[{symbol}] AI决策: 开多 {volume}手 @ {order_price:.2f}, 信心度={confidence:.2f}")
                 _sl = decision.get('stop_loss')
                 _pt = decision.get('profit_target')
+                try:
+                    if _pt is not None and float(_pt) <= float(order_price):
+                        _pt = None
+                        decision['profit_target'] = None
+                except Exception:
+                    _pt = None
                 _sl_txt = f"{float(_sl):.2f}" if isinstance(_sl, (int, float)) else "N/A"
                 _pt_txt = f"{float(_pt):.2f}" if isinstance(_pt, (int, float)) else "N/A"
                 # 计算首个分批目标（若AI提供levels_r）用于展示，避免方向误解
@@ -1548,10 +1791,18 @@ class TradeExecutor:
                 except Exception:
                     first_txt = "-"
                 Log(f"止损={_sl_txt}, 止盈(AI)={_pt_txt}, 首个分批目标={first_txt}")
-                Log(f"[{symbol}] 规模: equity={equity:.0f}, available={available:.0f}, notional/lot={notional_per_lot:.0f}, margin/lot={margin_per_lot:.0f}, target_lots={lots_by_target}, max_lots={max_lots_by_margin}, choose={volume}; used_margin→{margin_post:.0f}, 担保比={guarantee_ratio:.2f}")
+                try:
+                    src_l = PlatformAdapter.get_margin_ratio_source(symbol, 'long')
+                    tick_dbg = PlatformAdapter.get_pricetick(symbol) or 0
+                    minv_dbg = PlatformAdapter.get_min_volume(symbol)
+                    Log(f"[{symbol}] 规模: equity={equity:.0f}, available={available:.0f}, notional/lot={notional_per_lot:.0f}, margin/lot={margin_per_lot:.0f}, target_lots={lots_by_target}, max_lots={max_lots_by_margin}, choose={volume}; used_margin→{margin_post:.0f}, 担保比={guarantee_ratio:.2f} | 合约: size={mult}, tick={tick_dbg}, min={minv_dbg}, m_long={long_mr:.4f}({src_l})")
+                except Exception:
+                    Log(f"[{symbol}] 规模: equity={equity:.0f}, available={available:.0f}, notional/lot={notional_per_lot:.0f}, margin/lot={margin_per_lot:.0f}, target_lots={lots_by_target}, max_lots={max_lots_by_margin}, choose={volume}; used_margin→{margin_post:.0f}, 担保比={guarantee_ratio:.2f}")
 
                 # 记录决策和持仓均价
                 state['ai_decision'] = decision
+                if plan_id:
+                    state['current_plan_id'] = plan_id
                 state['entry_time'] = datetime.now()
                 state['position_avg_price'] = order_price
                 # 初始化追踪与峰值/谷值
@@ -1658,6 +1909,12 @@ class TradeExecutor:
                 Log(f"[{symbol}] AI决策: 开空 {volume}手 @ {order_price:.2f}, 信心度={confidence:.2f}")
                 _sl = decision.get('stop_loss')
                 _pt = decision.get('profit_target')
+                try:
+                    if _pt is not None and float(_pt) >= float(order_price):
+                        _pt = None
+                        decision['profit_target'] = None
+                except Exception:
+                    _pt = None
                 _sl_txt = f"{float(_sl):.2f}" if isinstance(_sl, (int, float)) else "N/A"
                 _pt_txt = f"{float(_pt):.2f}" if isinstance(_pt, (int, float)) else "N/A"
                 # 计算首个分批目标（空头）
@@ -1673,9 +1930,17 @@ class TradeExecutor:
                 except Exception:
                     first_txt = "-"
                 Log(f"止损={_sl_txt}, 止盈(AI)={_pt_txt}, 首个分批目标={first_txt}")
-                Log(f"[{symbol}] 规模: equity={equity:.0f}, available={available:.0f}, notional/lot={notional_per_lot:.0f}, margin/lot={margin_per_lot:.0f}, target_lots={lots_by_target}, max_lots={max_lots_by_margin}, choose={volume}; used_margin→{margin_post:.0f}, 担保比={guarantee_ratio:.2f}")
+                try:
+                    src_s = PlatformAdapter.get_margin_ratio_source(symbol, 'short')
+                    tick_dbg = PlatformAdapter.get_pricetick(symbol) or 0
+                    minv_dbg = PlatformAdapter.get_min_volume(symbol)
+                    Log(f"[{symbol}] 规模: equity={equity:.0f}, available={available:.0f}, notional/lot={notional_per_lot:.0f}, margin/lot={margin_per_lot:.0f}, target_lots={lots_by_target}, max_lots={max_lots_by_margin}, choose={volume}; used_margin→{margin_post:.0f}, 担保比={guarantee_ratio:.2f} | 合约: size={mult}, tick={tick_dbg}, min={minv_dbg}, m_short={short_mr:.4f}({src_s})")
+                except Exception:
+                    Log(f"[{symbol}] 规模: equity={equity:.0f}, available={available:.0f}, notional/lot={notional_per_lot:.0f}, margin/lot={margin_per_lot:.0f}, target_lots={lots_by_target}, max_lots={max_lots_by_margin}, choose={volume}; used_margin→{margin_post:.0f}, 担保比={guarantee_ratio:.2f}")
 
                 state['ai_decision'] = decision
+                if plan_id:
+                    state['current_plan_id'] = plan_id
                 state['entry_time'] = datetime.now()
                 state['position_avg_price'] = order_price
                 state['trailing'] = {
@@ -1804,8 +2069,11 @@ def _spawn_ai_job(context, sym):
             decision, error = context.ai_engine.call_deepseek_api(prompt, api_key=key_value)
             if decision:
                 # 将结果交回主循环处理
-                st['pending_decision'] = decision
-                st['pending_seq'] = job_seq
+                try:
+                    st['pending_decision'] = decision
+                    st['pending_seq'] = job_seq
+                except Exception:
+                    pass
             else:
                 try:
                     Log(f"[{sym}] AI后台任务失败: {error}")
@@ -2808,6 +3076,20 @@ def on_tick(context, tick):
                     Log(f"[{sym}] AI分析全文: {reason_full}")
                 if getattr(Config, 'LOG_FULL_AI_JSON', False):
                     Log(f"[{sym}] AI决策JSON: {json.dumps(pending, ensure_ascii=False)}")
+                # 记录决策日志（plan_id/简报）
+                try:
+                    if not hasattr(context, 'decision_log'):
+                        context.decision_log = {}
+                    if sym not in context.decision_log:
+                        context.decision_log[sym] = []
+                    context.decision_log[sym].append({
+                        'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        'signal': pending.get('signal'),
+                        'plan_id': pending.get('plan_id'),
+                        'reasoning': reason_full[:300]
+                    })
+                except Exception:
+                    pass
             except Exception:
                 pass
             try:
@@ -2922,72 +3204,31 @@ def on_bar(context, bars):
 
 
 def on_order_status(context, order):
-    """订单状态回调"""
+    """订单状态回调（仅记录与日志，不更新本地持仓/均价）。
+    为避免与 on_trade/on_order 重复累计，这里不再修改 local_pos/realized。
+    """
     # 兼容潜在的变量名拼写(contex)问题
     contex = context
     # 根据Gkoudai文档, order.status为中文字符串, 如"全部成交"
     if order.status == "全部成交":
-        Log(f"订单成交: {order.direction} {order.offset} {order.volume}手 @ {order.price:.2f}")
-
-        # 先维护本地持仓数量（运行期），再更新均价/已实盈亏
         try:
-            sym = getattr(order, 'symbol', None)
-            if sym:
-                # 归一化回调里的 symbol 到 state 的键
-                try:
-                    state_map = getattr(context, 'state', {})
-                    if sym not in state_map:
-                        su = str(sym).upper()
-                        resolved = None
-                        for k in state_map.keys():
-                            ku = k.upper()
-                            base = k.split('.')[0].upper()
-                            if su == ku or su == base or su in ku or base in su:
-                                resolved = k
-                                break
-                        if resolved:
-                            sym = resolved
-                except Exception:
-                    pass
-                try:
-                    st = context.state.get(sym, {})
-                    lp = int(st.get('local_pos') or 0)
-                    lp_before = lp
-                    _dir_s = str(getattr(order, 'direction', '') or '')
-                    _dir_u = _dir_s.upper()
-                    dir_buy = ("买" in _dir_s) or _dir_u.startswith('BUY') or ('LONG' in _dir_u)
-                    vol = int(getattr(order, 'volume', 0) or 0)
-                    if vol:
-                        # 无论开/平，买方向 +volume，卖方向 -volume（适配期货开平含义）
-                        lp = lp + vol if dir_buy else lp - vol
-                        st['local_pos'] = lp
-                        context.state[sym] = st
-                        try:
-                            Log(f"[{getattr(order,'symbol',sym)}] on_order_status: raw_symbol={getattr(order,'symbol',None)}→resolved={sym}, dir={getattr(order,'direction','')}, offset={getattr(order,'offset','')}, vol={vol}, local_pos: {lp_before}→{lp}")
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                # 记录成交前已实现，便于计算本次平仓盈亏
-                _st = context.state.get(sym, {}) if hasattr(context, 'state') else {}
-                _pre_realized = float(_st.get('realized_pnl') or 0.0)
-                update_pos_snapshot_on_fill(context, sym,
-                    direction=getattr(order, 'direction', ''),
-                    offset=getattr(order, 'offset', ''),
-                    price=float(getattr(order, 'price', 0.0) or 0),
-                    volume=int(getattr(order, 'volume', 0) or 0))
-                _post_realized = float(context.state.get(sym, {}).get('realized_pnl') or 0.0)
-                _delta_realized = _post_realized - _pre_realized
-        except Exception as e:
-            try:
-                Log(f"[警告] 本地持仓快照更新失败: {e}")
-            except Exception:
-                pass
-
-        # 更新交易统计 (order.offset为"平"时是平仓)
+            Log(f"订单成交: {order.direction} {order.offset} {order.volume}手 @ {order.price:.2f}")
+        except Exception:
+            pass
+        # 仅记录一条解析日志，便于追踪，但不改变本地持仓
         try:
-            if getattr(order, 'offset', '') == "平":
-                context.daily_trades += 1
+            sym_raw = getattr(order, 'symbol', None)
+            sym = sym_raw
+            state_map = getattr(context, 'state', {})
+            if sym and sym not in state_map:
+                su = str(sym).upper(); resolved = None
+                for k in state_map.keys():
+                    ku = k.upper(); base = k.split('.')[0].upper()
+                    if su == ku or su == base or su in ku or base in su:
+                        resolved = k; break
+                if resolved:
+                    sym = resolved
+            Log(f"[{sym_raw}] on_order_status: raw_symbol={sym_raw}→resolved={sym}, dir={getattr(order,'direction','')}, offset={getattr(order,'offset','')}, vol={getattr(order,'volume',0)}")
         except Exception:
             pass
 
@@ -3050,6 +3291,7 @@ def on_order_status(context, order):
                 vol = int(getattr(order, 'volume', 0) or 0)
                 px = float(getattr(order, 'price', 0.0) or 0.0)
                 ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                _delta_realized = 0.0
                 if off in ("开", "open", "OPEN"):
                     _su = side.upper()
                     tag = 'OpenLong' if ("买" in side or side.lower().startswith('buy') or ('LONG' in _su)) else 'OpenShort'
@@ -3078,6 +3320,9 @@ def on_order(context, order):
     依据文档：Status ∈ {SUBMITTING, NOTTRADED, PARTTRADED, ALLTRADED, CANCELLED, REJECTED}
     使用 order.traded 做增量计算，避免与 on_trade 重复。
     """
+    # 若不使用 on_order 作为成交来源，直接返回，避免与 on_trade 重复。
+    if not getattr(Config, 'USE_ON_ORDER_FOR_FILLS', False):
+        return
     try:
         status_raw = str(getattr(order, 'status', '') or '')
         status = status_raw.upper()
@@ -3217,6 +3462,12 @@ def on_trade(context, trade):
                     offset=getattr(trade, 'offset', ''),
                     price=px,
                     volume=vol)
+            except Exception:
+                pass
+            # 成交后立即输出一次账户快照（估算），便于观察 available/used_margin 变化
+            try:
+                acc = estimate_account(context, sym, px, st)
+                Log(f"[{sym}] 成交后 snapshot(估算): equity={acc['equity']:.0f}, available={acc['available']:.0f}, margin={acc['margin']:.0f}")
             except Exception:
                 pass
             # 标记到 order_traded_map，避免 on_order 重复累加
@@ -3507,8 +3758,13 @@ class PlatformAdapter:
 
     @staticmethod
     def get_margin_ratio(symbol, direction='long'):
+        # 记录来源，便于规模日志打印（'platform' 或 'default'）
+        if not hasattr(PlatformAdapter, '_MR_SOURCE'):
+            PlatformAdapter._MR_SOURCE = {}
         c = PlatformAdapter.get_contract(symbol)
-        # 常见命名：long_margin_ratio/short_margin_ratio 或 *_rate
+        source = 'default'
+        v = None
+        # 常见命名：long_margin_ratio/short_margin_ratio 或 *_rate 或统一 margin_ratio/margin_rate
         if c is not None:
             if direction == 'long':
                 v = _safe_get(c, 'long_margin_ratio', 'long_margin_rate', 'margin_ratio', 'margin_rate')
@@ -3516,13 +3772,26 @@ class PlatformAdapter:
                 v = _safe_get(c, 'short_margin_ratio', 'short_margin_rate', 'margin_ratio', 'margin_rate')
             try:
                 if v is not None:
-                    return float(v)
+                    val = float(v)
+                    source = 'platform'
+                    PlatformAdapter._MR_SOURCE[(symbol, direction)] = source
+                    return val
             except Exception:
                 pass
         # 兜底配置
         if direction == 'long':
-            return float(Config.DEFAULT_MARGIN_RATIO_LONG.get(symbol, 0.1))
-        return float(Config.DEFAULT_MARGIN_RATIO_SHORT.get(symbol, 0.1))
+            val = float(Config.DEFAULT_MARGIN_RATIO_LONG.get(symbol, 0.1))
+        else:
+            val = float(Config.DEFAULT_MARGIN_RATIO_SHORT.get(symbol, 0.1))
+        PlatformAdapter._MR_SOURCE[(symbol, direction)] = source
+        return val
+
+    @staticmethod
+    def get_margin_ratio_source(symbol, direction='long'):
+        try:
+            return getattr(PlatformAdapter, '_MR_SOURCE', {}).get((symbol, direction), 'unknown')
+        except Exception:
+            return 'unknown'
 
     
 
@@ -3745,5 +4014,35 @@ def collect_market_data(context, symbol, tick, indicators, data_collector, state
         'low_20': low_20_s,
         'price_range_pct': pr_pct_s,
     }
+
+    # 合并订单流摘要（简版）：基于近tick窗口的delta
+    try:
+        of_win = list(getattr(data_collector, '_of_delta_win', []))
+        if of_win:
+            import statistics as _stat
+            last20 = of_win[-20:] if len(of_win) >= 20 else of_win
+            market_data['of_delta_20'] = float(sum(last20))
+            last5 = of_win[-5:] if len(of_win) >= 5 else of_win
+            last10 = of_win[-10:] if len(of_win) >= 10 else of_win
+            market_data['of_ma5'] = float(sum(last5)) / max(1, len(last5))
+            market_data['of_ma10'] = float(sum(last10)) / max(1, len(last10))
+            base50 = of_win[-50:] if len(of_win) >= 50 else of_win
+            mu = float(sum(base50)) / max(1, len(base50))
+            try:
+                sigma = float(_stat.pstdev(base50)) if len(base50) > 1 else 0.0
+            except Exception:
+                sigma = 0.0
+            last = of_win[-1]
+            market_data['of_z50'] = ((last - mu) / sigma) if sigma and sigma > 0 else 0.0
+        else:
+            market_data['of_delta_20'] = 0.0
+            market_data['of_ma5'] = 0.0
+            market_data['of_ma10'] = 0.0
+            market_data['of_z50'] = 0.0
+    except Exception:
+        market_data['of_delta_20'] = 0.0
+        market_data['of_ma5'] = 0.0
+        market_data['of_ma10'] = 0.0
+        market_data['of_z50'] = 0.0
 
     return market_data
