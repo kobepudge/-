@@ -64,25 +64,23 @@ class Config:
         "al2601.SHFE": 5      # 5吨/手（示例值，平台优先）
     }
 
-    # AI配置（为方便使用，先写死在这里，直接填写即可）
-    # 注意：请将下面的 Key 替换为你的真实 Key。
-    # 如果你更偏好用环境变量，可把此行改回 os.getenv('DEEPSEEK_API_KEY', '')
-    DEEPSEEK_API_KEY = "sk-44e096b16c2a4f0ea364368583ea097d"
-    # 可选：多Key轮询/限流。若提供，将在这些Key之间轮询，每个Key同刻只跑1个请求。
-    # 你也可以把旧Key放在此列表中。
+    # AI配置（Qwen3 via apiy i）
+    # 新的OpenAI兼容端点与模型
+    DEEPSEEK_API_URL = "https://api.apiyi.com/v1/chat/completions"
+    DEEPSEEK_MODEL = "qwen3-max-2025-09-23"
+    # 三把API Key（按需轮询；每Key并发=1 由 KeyPool 保障）
+    DEEPSEEK_API_KEY = "sk-kCYwcWwdhkmHXnG649Cb537a43C94e92Ab133f10B6A31d27"
     DEEPSEEK_API_KEYS = [
-        "sk-44e096b16c2a4f0ea364368583ea097d",
-        "sk-c7c94df2cbbb423698cb895f25534501",
-        "sk-c2f94e4ed7f54018916aec6494677dd8",
+        "sk-kCYwcWwdhkmHXnG649Cb537a43C94e92Ab133f10B6A31d27",
+        "sk-G4Qctl7psfE0rPAS8543Ec52Fa7c400295B30bB5875d82Ab",
+        "sk-wj8FbCbq26bus8xN954e2661A176401bA21a18CaE60fD690",
     ]
-    DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
-    DEEPSEEK_MODEL = "deepseek-chat"
     DEEPSEEK_TEMPERATURE = 0.7
     # 注意：DeepSeek 通常限制 <= 8192；避免请求超限
     DEEPSEEK_MAX_TOKENS = 3500
 
     # AI决策频率 (秒) - 平衡成本和响应速度
-    AI_DECISION_INTERVAL = 180  # 降频：默认3分钟一次决策
+    AI_DECISION_INTERVAL = 300  # 以5分钟节拍为主：默认5分钟一次决策
     # 多标的错峰触发的最大抖动秒数（每个标的固定随机相位，避免同刻并发）
     AI_STAGGER_MAX_SECS = 20
 
@@ -119,7 +117,7 @@ class Config:
     # 数据窗口大小
     TICK_WINDOW = 100        # 缓存最近100个tick
     KLINE_1M_WINDOW = 300    # 1分钟K线300根（用于5分钟聚合与指标计算）
-    KLINE_1D_WINDOW = 50     # 日K线50根
+    KLINE_1D_WINDOW = 120    # 日K线窗口，确保≥60根可用于EMA趋势
     DEPTH_LIQ_WINDOW = 120   # 盘口深度流动性统计窗口（最近 N 个tick）
     # 触发AI所需的最小tick数（避免刚启动时过严）；原固定20调整为可配置，默认5
     TICKS_MIN_FOR_AI = 5
@@ -139,7 +137,7 @@ class Config:
     # 自适应与动态管理
     ADAPTIVE_PARAMS = {
         'UPTREND': {
-            'ai_interval_secs': 180,
+            'ai_interval_secs': 300,
             'cooldown_minutes': 5,
             'position_size_pct': 0.6,
             'trailing_type': 'atr',
@@ -147,7 +145,7 @@ class Config:
             'trailing_percent': 0.0,
         },
         'DOWNTREND': {
-            'ai_interval_secs': 180,
+            'ai_interval_secs': 300,
             'cooldown_minutes': 5,
             'position_size_pct': 0.6,
             'trailing_type': 'atr',
@@ -155,7 +153,7 @@ class Config:
             'trailing_percent': 0.0,
         },
         'SIDEWAYS': {
-            'ai_interval_secs': 240,
+            'ai_interval_secs': 300,
             'cooldown_minutes': 10,
             'position_size_pct': 0.3,
             'trailing_type': 'percent',
@@ -180,6 +178,35 @@ class Config:
     TRAILING_REFRESH_BARS = 2
     # 结构护栏：最近摆动位缓冲（tick）
     TRAILING_BUFFER_TICKS = 3
+
+    # 日线趋势判定与门槛
+    # 当日线趋势未就绪(N/A)时是否视作neutral（不阻断多周期一致性门槛）
+    TREAT_DAILY_NA_AS_NEUTRAL = True
+
+    # 多周期一致性策略：'hard' | 'soft' | 'off'
+    # hard: 严格要求 5m=IMPULSE_*；soft: 允许在日线顺势+5m为CORRECTION/CHAN_CENTER时小仓越权；off: 不看5m一致性，仅禁止与日线反向
+    MTF_MODE = 'soft'
+    # 越权小仓参数（仅 soft 时生效）
+    SOFT_MAX_PCT = 0.10                 # 小仓上限
+    SOFT_MIN_RRR = 2.0                  # 软越权最小 R:R
+    SOFT_COOLDOWN_MIN = 12              # 软越权成交后的最小冷却（分钟）
+    # 证据阈值：默认2项；当动量或突破成立时可降到1项
+    EVIDENCE_MIN_DEFAULT = 2
+    EVIDENCE_MIN_ON_MOMENTUM = 1
+    # 当AI信心较高时，即便未出现三件套，也可降低证据门槛
+    MIN_CONF_FOR_NO_TRIAD = 0.80
+    # 动量/回踩阈值
+    MOMENTUM_ATR_FRAC = 0.06            # |close-EMA20| ≥ 0.06×ATR 视为动量成立（与 z50/vr 或二者之一并列）
+    PULLBACK_ATR_FRAC = 0.7             # 回踩深度 ≤ 0.7×ATR 且收盘≥EMA20−0.1×ATR 视为回踩确认
+    
+    # 5m ZigZag 与聚合改良
+    # 动态阈值：基于 ATR 自适应的百分比，夹在[min,max]之间
+    ZIGZAG_THRESHOLD_PCT_5M = 0.6          # 兼容旧配置（作为默认/上限参考）
+    ZZ5M_TH_MIN_PCT = 0.25                 # 最小 0.25%
+    ZZ5M_TH_MAX_PCT = 0.8                  # 最大 0.8%
+    ZZ5M_ATR_K = 1.5                       # 动态阈值 = (ATR/均价)*100*ZZ5M_ATR_K，再夹在[min,max]
+    # MACD 近零阈值：相对 ATR（比旧的 0.2%*价 更敏感且合理）
+    MACD_NEAR_ZERO_ATR_K = 0.25            # |MACD| < ATR*此系数 视为 near_zero
 
     # 本地持久化（运行期）
     STATE_DIR = "state"
@@ -227,9 +254,17 @@ class Config:
 
     # 日志控制
     # 打印AI推理全文（不截断）
-    LOG_FULL_AI_REASONING = False
+    LOG_FULL_AI_REASONING = True
     # 打印AI完整JSON决策（可能较长）
-    LOG_FULL_AI_JSON = False
+    LOG_FULL_AI_JSON = True
+
+    # 成本-收益估计提示（供AI在推理中量化Frict/R用）
+    FEES_TICK_HINT = 0.5          # 手续费约合tick，若平台未提供费率时的估计
+    SLIPPAGE_TICK_HINT = 1.0      # 预期滑点tick估计
+
+    # 分批止盈启用门槛
+    MIN_LOTS_FOR_SCALE_OUT = 2            # 初始持仓<2手时禁用分批
+    SCALE_OUT_REQUIRE_REENTRY_CAPACITY = True  # 若开仓后无法再开最小手数，则禁用分批
 
 
 # 交易员手册（Rulebook）— 作为System Prompt的“公司制度”与执行器熔断的基准
@@ -256,12 +291,22 @@ SYSTEM_PROMPT_WAVE_FIRST = (
     "\n2) 双级别一致性：必须识别小级别(1m)与大级别(5m聚合)的波浪相位，明确是否同向或级别背离。"
     "\n3) 几何与结构：通道/斐波回撤与扩展位仅用于论证与目标位辅助。"
     "\n4) 动能与量能：MACD柱峰与量能状态仅作验证与风控，不得喧宾夺主。"
-    "\n5) 风险与执行：硬止损必给（signal为buy/sell时，stop_loss为必填且在正确一侧）；止盈计划需基于大/小级别关系进行分层(缩写如下)。"
-    "\n   - 若小级别顺大级别主升/主跌(IMPULSE同向)：允许更宽目标位/分批止盈在更远R倍数。"
-    "\n   - 若小级别为大级别回撤/修正：采用更保守止盈(更近的R倍数/更高比例的早期减仓)。"
-    "\n   - 若处于中枢震荡(CHAN_CENTER)：小仓位、快进快出、时间止盈优先。"
-    "\n6) 少做反趋势：若与5m/日线趋势相反，仅在出现强证据（有效突破+回踩确认/背离+放量等）且胜率显著时才可交易；默认小仓位。"
-    "\n7) 交易历史仅用于错误避免，不得因短期盈亏放大/缩小仓位。"
+    "\n5) 风险与执行：硬止损必给（signal为buy/sell时，stop_loss为必填且在正确一侧）；止盈计划需基于大/小级别关系进行分层。"
+    "\n   - 若小级别顺大级别主升/主跌(IMPULSE同向)：允许更远R倍数的分批止盈。"
+    "\n   - 若小级别为大级别回撤/修正：采用更保守的近目标分批。"
+    "\n   - 若处于中枢震荡(CHAN_CENTER)：小仓、快进快出、时间止盈优先。"
+    "\n6) 少做反趋势：与5m/日线趋势相反时，仅在“结构+动量+订单流”三类证据至少两项成立时考虑，且默认小仓。"
+    "\n7) 5m结构优先：主要信号来自5m；1m仅用于在5m信号出现后寻找精确入场（如5m主升中的1m回踩收复）。以定量要素判定相位（IMPULSE/CORRECTION/CHAN），包括："
+    "\n   - HH/HL 或 LL/LH 计数（近20根）；"
+    "\n   - d=(close−EMA20)/ATR 与 d_slope（近10根回归斜率/ATR）；"
+    "\n   - 最近两段ZigZag推进幅度/ATR（≥0.8视为推进）；"
+    "\n   - 距最近枢轴/通道边界的归一化距离（以ATR计）。"
+    "\n8) 定量表达：尽量用 ATR 归一化度量阈值与距离，少用含糊修饰词。"
+    "\n9) 自我反思：每次决策需写明最可能失败原因与提前认输信号（结构/动量/订单流）。"
+    "\n10) 交易历史仅用于错误避免，不得因短期盈亏放大/缩小仓位。"
+    "\n11) [成本-收益分析] 任何入场/加仓/减仓决策，需量化总摩擦(以tick计)=点差tick+预计滑点tick+手续费tick，并与风险宽度risk_ticks=|entry−stop|/tick对比，给出 Frict/R 比例与是否划算的结论。"
+    "\n12) [默认谨慎] 多周期冲突或 Frict/R≥0.30 时倾向 hold，仅在多重证据共振(A+)或期望R:R显著时入场；如入场，需给出更紧的失效与自我否定条件。"
+    "\n13) 止损铁律(防洗刷)：stop_loss 应基于5m结构（最近枢轴/通道）或 ATR_5m；禁止仅以1m ATR/枢轴作为唯一依据。"
 )
 
 def construct_autonomous_trading_prompt(market_data):
@@ -325,6 +370,14 @@ def construct_autonomous_trading_prompt(market_data):
 - **DeltaMA(5/10)**: {market_data.get('of_ma5', 0.0):.1f} / {market_data.get('of_ma10', 0.0):.1f}
 - **Delta Z-Score(50)**: {market_data.get('of_z50', 0.0):.2f}
 
+## 成本-收益估计（tick单位，用于 Frict/R）
+- **tick_size**: {market_data['tick_size']}
+- **spread_ticks≈**: {(market_data.get('spread_ticks_hint') or 0):.2f}
+- **slippage_tick_hint≈**: {(market_data.get('slippage_tick_hint') or 0):.2f}
+- **fees_tick_hint≈**: {(market_data.get('fees_tick_hint') or 0):.2f}
+- **friction_ticks_hint≈**: {(market_data.get('friction_ticks_hint') or 0):.2f}
+提示：若平台未提供费率/滑点，以上提示用于估算总摩擦=spread_ticks+slip+fee。
+
 ## 技术指标 (1分钟周期 - 入场分析)
 - **EMA20**: {market_data['ema_20']:.2f}
 - **EMA60**: {market_data['ema_60']:.2f}
@@ -333,6 +386,7 @@ def construct_autonomous_trading_prompt(market_data):
 - **Histogram**: {market_data['macd_hist']:.4f}
 - **RSI(14)**: {market_data['rsi']:.2f}
 - **ATR(14)**: {market_data['atr']:.2f} (波动率指标)
+ - **ATR(5m)**: {(market_data.get('atr_5m') or 0):.2f} (大周期波动率)
 
 ## 价格结构 (最近20根1分钟K线)
 - **最高价**: {market_data['high_20']:.2f}
@@ -450,6 +504,9 @@ def construct_autonomous_trading_prompt(market_data):
                 'threshold_5m_pct': market_data.get('zigzag_threshold_5m'),
                 'pivots_5m': market_data.get('zigzag_pivots_5m', []),
             },
+            'indicators_5m': {
+                'atr_5m': market_data.get('atr_5m')
+            },
             'indicators_1m': {
                 'ema20': market_data.get('ema_20'),
                 'ema60': market_data.get('ema_60'),
@@ -465,7 +522,11 @@ def construct_autonomous_trading_prompt(market_data):
                 'imbalance_l1': market_data.get('imbalance_l1'),
                 'imbalance_l5': market_data.get('imbalance_l5'),
                 'liquidity_score': market_data.get('liquidity_score'),
-                'liquidity_state': market_data.get('liquidity_state')
+                'liquidity_state': market_data.get('liquidity_state'),
+                'fees_tick_hint': market_data.get('fees_tick_hint'),
+                'slippage_tick_hint': market_data.get('slippage_tick_hint'),
+                'spread_ticks_hint': market_data.get('spread_ticks_hint'),
+                'friction_ticks_hint': market_data.get('friction_ticks_hint')
             }
         }
         _structured_json = json.dumps(_structured_data, ensure_ascii=False)
@@ -476,7 +537,7 @@ def construct_autonomous_trading_prompt(market_data):
     json_block = """
 {
   "market_state": "UPTREND|DOWNTREND|SIDEWAYS|REVERSAL|VOLATILE|OTHER",
-  "reasoning": "请按以下4步各用≤30字短句：1) 主要论点(基于5m/1m结构)；2) 支撑证据(如5m顺势+of_z50>0.8+量能>1.2)；3) 反方风险(此论点会如何失败：如5m衰竭/假突破/流动性差)；4) 结论(确认/修正/放弃及简因)。禁止换行。",
+  "reasoning": "严格按此短句模板（≤180字，不换行）：1m相位=IMP/CORR/CHAN；结构[S]=推进≈xATR、HH/HL=a/b、距枢轴=yATR；动量[M]=d=±p、d_slope=±；订单流[O]=z50=±z、Δ20同号/否；成本=st~{spread_ticks}t, slip~{slip_t}t, fee~{fee_t}t→Frict=F；Risk=R(t)；Frict/R=q；结论=breakout/pullback/反向；失效=结构位±k×ATR；失败因=…；提前认输=…",
   "signal": "buy|sell|hold|close|adjust_stop",
   "confidence": 0.75,
   "trend_alignment": "aligned|opposite|neutral",  // 与5m/日线方向是否一致
@@ -744,17 +805,46 @@ class MarketDataCollector:
             am_1m = None
 
         if am_1m is not None and getattr(am_1m, 'count', 0) > 0:
-            # ArrayManager对象有open, high, low, close, volume等numpy数组
-            # 转换为字典列表格式供后续使用
-            self.kline_1m_buffer = []
-            for i in range(am_1m.count):
-                self.kline_1m_buffer.append({
-                    'open': am_1m.open[i],
-                    'high': am_1m.high[i],
-                    'low': am_1m.low[i],
-                    'close': am_1m.close[i],
-                    'volume': am_1m.volume[i]
-                })
+            # 若平台实时返回条数过少（<120），避免覆盖掉启动时回填的长窗口；优先回填再用
+            cnt = int(getattr(am_1m, 'count', 0) or 0)
+            need_min = int(getattr(Config, 'MIN_1M_BARS_FOR_AI', 20))
+            # 我们需要至少120根来计算完整指标
+            min_for_ind = 120
+            if cnt >= min_for_ind:
+                buf = []
+                for i in range(cnt):
+                    buf.append({
+                        'open': am_1m.open[i],
+                        'high': am_1m.high[i],
+                        'low': am_1m.low[i],
+                        'close': am_1m.close[i],
+                        'volume': am_1m.volume[i]
+                    })
+                self.kline_1m_buffer = buf
+            else:
+                # 条数不足：尝试历史回填，否则保留现有缓存，避免被短窗口覆盖
+                try:
+                    bars_1m = query_history(symbol, '1m', number=Config.KLINE_1M_WINDOW)
+                except Exception as e:
+                    bars_1m = None
+                    Log(f"[提示] 1m回填尝试失败: {e}")
+                if bars_1m and len(bars_1m) >= min_for_ind:
+                    self.kline_1m_buffer = []
+                    for bar in bars_1m:
+                        self.kline_1m_buffer.append({
+                            'open': bar.open_price,
+                            'high': bar.high_price,
+                            'low': bar.low_price,
+                            'close': bar.close_price,
+                            'volume': bar.volume
+                        })
+                    Log(f"[提示] 1m使用历史回填优先: {len(self.kline_1m_buffer)} 根 (实时仅 {cnt})")
+                else:
+                    # 不覆盖，等待累计
+                    try:
+                        Log(f"[提示] 1m实时仅 {cnt} 根(<{min_for_ind}) 且无足够回填，保留现有 {len(self.kline_1m_buffer)} 根，等待累计")
+                    except Exception:
+                        pass
         else:
             # Fallback: 使用 query_history 回填，避免因实时通道未就绪而无数据
             try:
@@ -808,6 +898,51 @@ class MarketDataCollector:
             except Exception as e:
                 Log(f"[警告] query_history('1d') 异常: {e}")
 
+    @staticmethod
+    def _aggregate_to_5min_anchored(kline_1m_buffer):
+        """按时间锚定聚合1m为5m。若无时间戳则退化到简单切片版。"""
+        if not kline_1m_buffer or len(kline_1m_buffer) < 5:
+            return []
+        try:
+            # 需要每个bar含有 'datetime' 字段
+            first_ts = kline_1m_buffer[0].get('datetime')
+            if first_ts is None:
+                # 退化：每5根切片
+                out = []
+                for i in range(0, len(kline_1m_buffer) - 4, 5):
+                    seg = kline_1m_buffer[i:i+5]
+                    out.append({
+                        'open': seg[0]['open'],
+                        'high': max(b['high'] for b in seg),
+                        'low': min(b['low'] for b in seg),
+                        'close': seg[-1]['close'],
+                        'volume': sum(b.get('volume', 0.0) or 0.0 for b in seg),
+                        'datetime': seg[-1].get('datetime')
+                    })
+                return out
+            # 时间锚定到 5 分钟整
+            from datetime import datetime as _dt
+            buckets = []
+            cur = None
+            cur_key = None
+            for b in kline_1m_buffer:
+                ts = b.get('datetime')
+                if ts is None:
+                    continue
+                base = ts.replace(minute=(ts.minute - ts.minute % 5), second=0, microsecond=0)
+                if cur_key != base:
+                    cur = {'open': b['open'], 'high': b['high'], 'low': b['low'], 'close': b['close'], 'volume': b.get('volume', 0.0) or 0.0, 'datetime': base}
+                    buckets.append(cur)
+                    cur_key = base
+                else:
+                    cur['high'] = max(cur['high'], b['high'])
+                    cur['low'] = min(cur['low'], b['low'])
+                    cur['close'] = b['close']
+                    cur['volume'] = (cur.get('volume', 0.0) or 0.0) + (b.get('volume', 0.0) or 0.0)
+            return buckets
+        except Exception:
+            return []
+
     def calculate_indicators(self):
         """计算技术指标 - 以1分钟为节拍，并附带日线趋势与ZigZag摘要"""
         if len(self.kline_1m_buffer) < 120:
@@ -847,13 +982,15 @@ class MarketDataCollector:
         low_20 = min(window_lows)
         price_range_pct = ((high_20 - low_20) / low_20) * 100 if low_20 > 0 else 0
 
-        # 日线趋势（仅使用已完成日线）
+        # 日线趋势（放宽：≥20根即计算；长度不足60时用可用长度代替）
         d_ema_20 = d_ema_60 = d_macd = None
         d_trend = None
-        if len(self.kline_1d_buffer) >= 60:
+        day_count = len(self.kline_1d_buffer)
+        if day_count >= 20:
             d_closes = [k['close'] for k in self.kline_1d_buffer]
             d_ema_20 = self._calculate_ema(d_closes, 20)
-            d_ema_60 = self._calculate_ema(d_closes, 60)
+            # 若不足60根，用可用长度替代，避免长时间N/A
+            d_ema_60 = self._calculate_ema(d_closes, 60) if day_count >= 60 else self._calculate_ema(d_closes, day_count)
             d_macd, d_sig, d_hist = self._calculate_macd(d_closes)
             if d_ema_20 and d_ema_60:
                 if d_ema_20 > d_ema_60 and d_macd > 0:
@@ -888,20 +1025,31 @@ class MarketDataCollector:
             if fr or fe:
                 fib_summary = f"ret:0.382={fr.get('0.382','')},0.5={fr.get('0.5','')},0.618={fr.get('0.618','')}; ext:1.272={fe.get('1.272','')},1.618={fe.get('1.618','')}"
 
-        # ===== 5分钟聚合级别：大级别波浪/斐波与相位 =====
-        kline_5m = self._aggregate_to_5min(self.kline_1m_buffer)
+        # ===== 5分钟聚合级别：大级别波浪/斐波与相位（时间锚定版） =====
+        kline_5m = self._aggregate_to_5min_anchored(self.kline_1m_buffer)
         zz5m_summary = 'N/A'
         fib_summary_5m = 'N/A'
         wave_phase_1m = 'N/A'
         wave_phase_5m = 'N/A'
         pivots_5m = []
+        atr_5m_val = 0.0
         try:
             if kline_5m and len(kline_5m) >= 24:  # 至少两小时数据
                 closes_5m = [k['close'] for k in kline_5m]
+                highs_5m = [k['high'] for k in kline_5m]
+                lows_5m = [k['low'] for k in kline_5m]
                 ema20_5m = self._calculate_ema(closes_5m, 20) if len(closes_5m) >= 20 else closes_5m[-1]
                 ema60_5m = self._calculate_ema(closes_5m, 60) if len(closes_5m) >= 60 else ema20_5m
                 macd_5m, sig_5m, hist_5m = self._calculate_macd(closes_5m)
-                zigzag_5m = self._calculate_zigzag(closes_5m, threshold_pct=getattr(Config, 'ZIGZAG_THRESHOLD_PCT_5M', 0.6))
+                # 5m ATR 与自适应 ZigZag 阈值（高低点版）
+                atr_5m = self._calculate_atr(highs_5m, lows_5m, closes_5m, 14)
+                atr_5m_val = float(atr_5m or 0.0)
+                avg_px5 = sum(closes_5m[-20:]) / max(1, len(closes_5m[-20:]))
+                dyn_th = ((atr_5m / max(1e-6, avg_px5)) * 100.0 * float(getattr(Config, 'ZZ5M_ATR_K', 1.5) or 1.5)) if avg_px5 else float(getattr(Config, 'ZIGZAG_THRESHOLD_PCT_5M', 0.6) or 0.6)
+                th_min = float(getattr(Config, 'ZZ5M_TH_MIN_PCT', 0.25) or 0.25)
+                th_max = float(getattr(Config, 'ZZ5M_TH_MAX_PCT', 0.8) or 0.8)
+                th5 = max(th_min, min(th_max, float(dyn_th)))
+                zigzag_5m = _zigzag_by_pct_hilo(kline_5m, threshold_pct=th5)
                 if zigzag_5m and zigzag_5m.get('pivots'):
                     piv5 = zigzag_5m['pivots'][-6:]
                     zz5m_summary = "; ".join([f"{p['type']}@{p['price']:.2f}" for p in piv5])
@@ -921,7 +1069,7 @@ class MarketDataCollector:
                     if fr5 or fe5:
                         fib_summary_5m = f"ret:0.382={fr5.get('0.382','')},0.5={fr5.get('0.5','')},0.618={fr5.get('0.618','')}; ext:1.272={fe5.get('1.272','')},1.618={fe5.get('1.618','')}"
                 wave_phase_5m = self._classify_wave_phase(
-                    ema20=ema20_5m, ema60=ema60_5m, macd=macd_5m, zigzag=(zigzag_5m or {'pivots': []}), closes=closes_5m
+                    ema20=ema20_5m, ema60=ema60_5m, macd=macd_5m, zigzag=(zigzag_5m or {'pivots': []}), closes=closes_5m, atr=atr_5m
                 )
         except Exception:
             pass
@@ -929,7 +1077,7 @@ class MarketDataCollector:
         # 小级别(1m)波浪相位
         try:
             wave_phase_1m = self._classify_wave_phase(
-                ema20=ema_20, ema60=ema_60, macd=macd, zigzag=(zigzag or {'pivots': []}), closes=closes_1m
+                ema20=ema_20, ema60=ema_60, macd=macd, zigzag=(zigzag or {'pivots': []}), closes=closes_1m, atr=atr
             )
         except Exception:
             pass
@@ -942,6 +1090,7 @@ class MarketDataCollector:
             'macd_hist': hist,
             'rsi': rsi,
             'atr': atr,
+            'atr_5m': atr_5m_val,
             # 序列（用于AI波浪识别）
             'closes_1m': closes_1m[-120:],
             'avg_volume_20': avg_volume_20,
@@ -1142,8 +1291,64 @@ class MarketDataCollector:
                 fib = {'retracements': retr, 'extensions': ext}
         return {'pivots': pivots, 'fib': fib}
 
+
+def _zigzag_by_pct_hilo(klines, threshold_pct=0.3):
+    """高低点版 ZigZag：
+    - 使用每个bar的high/low推导转折，较收盘更贴合推进。
+    - threshold_pct 为百分比阈值。
+    返回 {'pivots': [...], 'fib': {...}}
+    """
+    try:
+        if not klines or len(klines) < 10:
+            return {'pivots': [], 'fib': {}}
+        th = abs(float(threshold_pct)) / 100.0
+        pivots = []
+        f = klines[0]
+        last_pivot_price = (float(f['high']) + float(f['low'])) / 2.0
+        direction = 0   # 1 up, -1 down, 0 unknown
+        extreme_price = float(f['high'])
+        extreme_idx = 0
+        for i, b in enumerate(klines[1:], start=1):
+            hi = float(b['high']); lo = float(b['low'])
+            if direction >= 0:
+                if hi > extreme_price:
+                    extreme_price = hi; extreme_idx = i
+                dd = (extreme_price - lo) / extreme_price if extreme_price > 0 else 0.0
+                if direction == 1 and dd >= th:
+                    pivots.append({'idx': extreme_idx, 'price': extreme_price, 'type': 'H'})
+                    direction = -1; last_pivot_price = extreme_price
+                    extreme_price = lo; extreme_idx = i
+                elif direction == 0:
+                    up = (hi - last_pivot_price) / last_pivot_price if last_pivot_price > 0 else 0.0
+                    if up >= th:
+                        direction = 1; extreme_price = hi; extreme_idx = i
+            if direction <= 0:
+                if lo < extreme_price:
+                    extreme_price = lo; extreme_idx = i
+                du = (hi - extreme_price) / abs(extreme_price) if extreme_price != 0 else 0.0
+                if direction == -1 and du >= th:
+                    pivots.append({'idx': extreme_idx, 'price': extreme_price, 'type': 'L'})
+                    direction = 1; last_pivot_price = extreme_price
+                    extreme_price = hi; extreme_idx = i
+                elif direction == 0:
+                    down = (last_pivot_price - lo) / last_pivot_price if last_pivot_price > 0 else 0.0
+                    if down >= th:
+                        direction = -1; extreme_price = lo; extreme_idx = i
+        # 斐波（最后一段）
+        fib = {}
+        if len(pivots) >= 2:
+            a = pivots[-2]['price']; b = pivots[-1]['price']; leg = b - a
+            if leg != 0:
+                def _fmt(v): return f"{v:.2f}"
+                retr = {'0.382': _fmt(b - 0.382*leg), '0.5': _fmt(b - 0.5*leg), '0.618': _fmt(b - 0.618*leg)}
+                ext = {'1.272': _fmt(b + 1.272*leg), '1.618': _fmt(b + 1.618*leg)}
+                fib = {'retracements': retr, 'extensions': ext}
+        return {'pivots': pivots, 'fib': fib}
+    except Exception:
+        return {'pivots': [], 'fib': {}}
+
     @staticmethod
-    def _classify_wave_phase(ema20, ema60, macd, zigzag, closes):
+    def _classify_wave_phase(ema20, ema60, macd, zigzag, closes, atr=None):
         """基于EMA倾向 + MACD符号 + 最近ZigZag枢轴，粗略判别波浪相位。
         返回：IMPULSE_UP / IMPULSE_DOWN / CORRECTION / CHAN_CENTER
         """
@@ -1160,9 +1365,13 @@ class MarketDataCollector:
                     ll = True
             trend_up = (ema20 > ema60 and macd > 0)
             trend_dn = (ema20 < ema60 and macd < 0)
-            # 震荡：ema接近/交错，macd近0轴
+            # 震荡：ema接近/交错，macd近0轴（改为相对ATR的近零判断）
             try:
-                near_zero = abs(macd) < (0.002 * (sum(closes[-20:]) / 20.0))
+                if atr is not None and atr > 0:
+                    near_zero = abs(macd) < (float(getattr(Config, 'MACD_NEAR_ZERO_ATR_K', 0.25) or 0.25) * float(atr))
+                else:
+                    # 退化：用更紧的价比例阈值
+                    near_zero = abs(macd) < (0.0015 * (sum(closes[-20:]) / 20.0))
             except Exception:
                 near_zero = False
             if trend_up and hh:
@@ -1311,7 +1520,7 @@ class TradeExecutor:
         def _is_ai_insane(decision_obj, md_obj):
             try:
                 sig = str(decision_obj.get('signal', 'hold') or 'hold').lower()
-                if sig not in ('buy', 'sell', 'close', 'hold'):
+                if sig not in ('buy', 'sell', 'close', 'hold', 'adjust_stop'):
                     return True, f"未知signal={sig}"
                 if sig in ('buy', 'sell') and TRADER_RULEBOOK.get('mandatory_stop_loss', True):
                     _sl = decision_obj.get('stop_loss', None)
@@ -1323,11 +1532,13 @@ class TradeExecutor:
                 if ps > float(TRADER_RULEBOOK.get('max_position_pct', 0.6)):
                     decision_obj['position_size_pct'] = float(TRADER_RULEBOOK.get('max_position_pct', 0.6))
                 try:
-                    rrr = float(decision_obj.get('risk_reward_ratio', 0) or 0)
-                    dtrend = str((md_obj or {}).get('d_trend') or 'SIDEWAYS').upper()
-                    is_counter = ((dtrend == 'UPTREND' and sig == 'sell') or (dtrend == 'DOWNTREND' and sig == 'buy'))
-                    if not is_counter and rrr and rrr < float(TRADER_RULEBOOK.get('min_reward_risk_ratio', 2.0)):
-                        return True, f"顺势RRR不足({rrr:.2f}<{float(TRADER_RULEBOOK.get('min_reward_risk_ratio', 2.0)):.2f})"
+                    # 仅对新开仓校验顺势RRR；调整止损不参与RRR校验
+                    if sig in ('buy', 'sell'):
+                        rrr = float(decision_obj.get('risk_reward_ratio', 0) or 0)
+                        dtrend = str((md_obj or {}).get('d_trend') or 'SIDEWAYS').upper()
+                        is_counter = ((dtrend == 'UPTREND' and sig == 'sell') or (dtrend == 'DOWNTREND' and sig == 'buy'))
+                        if not is_counter and rrr and rrr < float(TRADER_RULEBOOK.get('min_reward_risk_ratio', 2.0)):
+                            return True, f"顺势RRR不足({rrr:.2f}<{float(TRADER_RULEBOOK.get('min_reward_risk_ratio', 2.0)):.2f})"
                 except Exception:
                     pass
                 return False, "OK"
@@ -1449,11 +1660,19 @@ class TradeExecutor:
         try:
             if getattr(Config, 'LOW_CHURN_MODE', False) and signal in ('buy', 'sell'):
                 trend_daily = str((md.get('d_trend') if isinstance(md, dict) else 'SIDEWAYS') or 'SIDEWAYS').upper()
-                is_counter = ((trend_daily == 'UPTREND' and signal == 'sell') or (trend_daily == 'DOWNTREND' and signal == 'buy'))
+                # 严格反趋势：日线反向 且 5m为反向IMPULSE 才按硬门槛处理
+                wp5_eff = str((md.get('wave_phase_5m') if isinstance(md, dict) else 'N/A') or 'N/A').upper()
+                is_daily_opposite = ((trend_daily == 'UPTREND' and signal == 'sell') or (trend_daily == 'DOWNTREND' and signal == 'buy'))
+                strict_counter = (
+                    (is_daily_opposite and (
+                        (signal == 'sell' and wp5_eff == 'IMPULSE_DOWN') or
+                        (signal == 'buy' and wp5_eff == 'IMPULSE_UP')
+                    ))
+                )
                 rrr = float(decision.get('risk_reward_ratio', 0) or 0)
                 edge = decision.get('edge_over_friction', None)
 
-                if is_counter:
+                if strict_counter:
                     reasons = []
                     if confidence < float(getattr(Config, 'CT_MIN_CONF', 0.7)):
                         reasons.append(f"conf {confidence:.2f}<{getattr(Config,'CT_MIN_CONF',0.7):.2f}")
@@ -1465,7 +1684,7 @@ class TradeExecutor:
                     except Exception:
                         pass
                     if reasons:
-                        Log(f"[{symbol}] 反趋势门槛未过({trend_daily} vs {signal}): {', '.join(reasons)}，忽略新仓")
+                        Log(f"[{symbol}] 反趋势门槛未过({trend_daily} vs {signal}, wp5={wp5_eff}): {', '.join(reasons)}，忽略新仓")
                         return
                     # 缩仓与冷却
                     ps = float(decision.get('position_size_pct', 0.5) or 0.5)
@@ -1478,7 +1697,7 @@ class TradeExecutor:
                     except Exception:
                         st_cd = 0
                     state['pending_cooldown_minutes'] = max(st_cd, cd_min)
-                    Log(f"[{symbol}] 反趋势单确认: 缩仓至{decision.get('position_size_pct')}, 冷却≥{int(cd_min)}min, RRR={rrr:.2f}, conf={confidence:.2f}")
+                    Log(f"[{symbol}] 反趋势单确认(严格): 缩仓至{decision.get('position_size_pct')}, 冷却≥{int(cd_min)}min, RRR={rrr:.2f}, conf={confidence:.2f}")
                 else:
                     # 顺势最小RRR
                     min_rrr = float(getattr(Config, 'TREND_MIN_RRR', 2.0))
@@ -1758,37 +1977,88 @@ class TradeExecutor:
             if position_size <= 0:
                 Log(f"[{symbol}] 运行期gating后仓位=0，忽略新仓 buy")
                 return
-            # 入场严选（多头）：多周期一致 + 结构突破 + 量价/订单流
+            # 入场严选（多头）：多周期一致（支持软/关模式） + 结构突破 + 量价/订单流
             try:
                 md_g = state.get('last_market_data') if isinstance(state, dict) else None
                 if not isinstance(md_g, dict):
                     Log(f"[{symbol}] 入场拒绝(buy): 快照未就绪(last_market_data)"); return
                 wp5 = str(md_g.get('wave_phase_5m', 'N/A') or 'N/A').upper()
-                dtrend = str(md_g.get('d_trend', 'N/A') or 'N/A').upper()
-                if wp5 != 'IMPULSE_UP' or dtrend == 'DOWNTREND':
-                    Log(f"[{symbol}] 入场拒绝(buy): 多周期不一致(wp5={wp5}, dtrend={dtrend})"); return
+                dtrend_raw = str(md_g.get('d_trend', 'N/A') or 'N/A').upper()
+                dtrend_eff = ('NEUTRAL' if (dtrend_raw == 'N/A' and getattr(Config,'TREAT_DAILY_NA_AS_NEUTRAL', True)) else dtrend_raw)
+                mtf_mode = str(getattr(Config, 'MTF_MODE', 'soft') or 'soft').lower()
+                # 日线反向不再前置硬拒：交由后续严格反趋势门槛与小仓探路处理
+                # 5m一致性/越权判定
+                allow_by_mtf = False
+                override_small = False
+                if wp5 == 'IMPULSE_UP':
+                    allow_by_mtf = True
+                elif mtf_mode == 'off':
+                    allow_by_mtf = True
+                elif mtf_mode == 'soft' and wp5 in ('CORRECTION', 'CHAN_CENTER', 'N/A'):
+                    # 软越权：后续证据满足才放行
+                    allow_by_mtf = True
+                    override_small = True
+                    if wp5 == 'N/A':
+                        try:
+                            dc = state.get('data_collector'); c5 = len((md_g.get('closes_5m') or []))
+                            l1 = len(getattr(dc, 'kline_1m_buffer', []) or [])
+                            Log(f"[{symbol}] [提示] 软越权: 5m相位N/A( len5m={c5}, len1m={l1} )，按中性处理，小仓探路")
+                        except Exception:
+                            Log(f"[{symbol}] [提示] 软越权: 5m相位N/A，按中性处理，小仓探路")
+                else:
+                    # 拒单并记录日线根数
+                    try:
+                        dc = state.get('data_collector'); day_count = len(getattr(dc, 'kline_1d_buffer', []) or [])
+                    except Exception:
+                        day_count = -1
+                    Log(f"[{symbol}] 入场拒绝(buy): 多周期不一致(wp5={wp5}, dtrend={dtrend_raw}, day_count={day_count})"); return
                 atr_g = float(md_g.get('atr') or 0.0)
                 high20 = float(md_g.get('high_20') or last_price)
                 low20 = float(md_g.get('low_20') or last_price)
                 rng = max(0.0, high20 - low20)
                 ratio = (rng / max(1e-6, atr_g)) if atr_g else 0.0
-                if ratio < 1.2:
+                ratio_thr = 1.5 if mtf_mode == 'off' else 1.2
+                if ratio < ratio_thr:
                     Log(f"[{symbol}] 入场拒绝(buy): 微震荡(range20/ATR={ratio:.2f})"); return
-                # 1m收盘确认突破
+                # 入场确认（放宽）：满足下列任意一种
+                # A) 1m收盘突破近20高点（去掉+1tick）
+                # B) 回踩确认：低于EMA20不超过0.5×ATR后收回EMA20之上
+                # C) 动量确认：收盘在EMA20上方，且(价差≥0.1×ATR或 of_z50≥0.8 或 volume_ratio≥1.2)
                 try:
                     kbuf = getattr(state.get('data_collector'), 'kline_1m_buffer', [])
                     last_close = float(kbuf[-1]['close']) if kbuf else float(last_price)
                 except Exception:
                     last_close = float(last_price)
                 tksz = float(PlatformAdapter.get_pricetick(symbol) or 0.01)
-                if not (last_close > (high20 + tksz)):
-                    Log(f"[{symbol}] 入场拒绝(buy): 未收盘确认突破(high20)"); return
+                ema20_v = float(md_g.get('ema_20') or 0.0)
+                atr_v = float(md_g.get('atr') or 0.0)
+                ofz = float(md_g.get('of_z50') or 0.0)
+                vratio = float(md_g.get('volume_ratio') or 1.0)
+                # 使用配置阈值：突破/回踩/动量
+                breakout_ok = (last_close > high20)
+                pullback_ok = (ema20_v > 0 and atr_v > 0 and (ema20_v - low20) <= (float(getattr(Config,'PULLBACK_ATR_FRAC',0.7)) * atr_v) and last_close > ema20_v)
+                momentum_ok = (ema20_v > 0 and last_close > ema20_v and (((last_close - ema20_v) >= (float(getattr(Config,'MOMENTUM_ATR_FRAC',0.06)) * atr_v)) or ofz >= 0.8 or vratio >= 1.2))
                 evid = 0
                 if float(md_g.get('volume_ratio') or 1.0) >= 1.2: evid += 1
                 if float(md_g.get('of_delta_20') or 0.0) > 0 and float(md_g.get('of_ma5') or 0.0) > 0: evid += 1
                 if float(md_g.get('of_z50') or 0.0) >= 0.8: evid += 1
-                if evid < 2:
-                    Log(f"[{symbol}] 入场拒绝(buy): 证据不足(of/vol)={evid}/3"); return
+                # 三件套作为加分证据
+                triad_hit = (breakout_ok or pullback_ok or momentum_ok)
+                if triad_hit:
+                    evid += 1
+                # 动态证据阈值：动量/突破或高信心时降至配置最低值
+                try:
+                    ai_conf = float(decision.get('confidence', 0) or 0)
+                except Exception:
+                    ai_conf = 0.0
+                try:
+                    min_evid = int(getattr(Config, 'EVIDENCE_MIN_ON_MOMENTUM', 1)) if ((breakout_ok or momentum_ok) or (ai_conf >= float(getattr(Config,'MIN_CONF_FOR_NO_TRIAD',0.80)))) else int(getattr(Config, 'EVIDENCE_MIN_DEFAULT', 2))
+                except Exception:
+                    min_evid = 1 if ((breakout_ok or momentum_ok) or (ai_conf >= 0.80)) else 2
+                if evid < min_evid:
+                    Log(f"[{symbol}] 入场拒绝(buy): 证据不足(evid={evid}/{min_evid}); 三件套 b/o/m={int(breakout_ok)}/{int(pullback_ok)}/{int(momentum_ok)}, z50={ofz:.2f}, vr={vratio:.2f}"); return
+                if evid < min_evid:
+                    Log(f"[{symbol}] 入场拒绝(buy): 证据不足(of/vol)={evid}/{min_evid} (动量/突破={int(breakout_ok or momentum_ok)})"); return
                 # 成本护栏：risk_ticks ≥ 1.5×friction_ticks
                 try:
                     ai_sl0 = decision.get('stop_loss')
@@ -1802,6 +2072,29 @@ class TradeExecutor:
                             Log(f"[{symbol}] 入场拒绝(buy): 边际不足(risk={risk_ticks:.1f}<1.5×fric={fric_ticks:.1f})"); return
                 except Exception:
                     pass
+                # 软越权：小仓夹紧 + RRR门槛 + 冷却（走 SOFT_* 配置）
+                if override_small:
+                    try:
+                        rrr = float(decision.get('risk_reward_ratio', 0) or 0)
+                    except Exception:
+                        rrr = 0
+                    min_rrr = float(getattr(Config, 'SOFT_MIN_RRR', 2.0) or 2.0)
+                    if rrr and rrr < min_rrr:
+                        Log(f"[{symbol}] 入场拒绝(buy-越权): RRR不足({rrr:.2f}<{min_rrr:.2f})"); return
+                    try:
+                        max_pct = float(getattr(Config, 'SOFT_MAX_PCT', 0.10) or 0.10)
+                        ps0 = float(decision.get('position_size_pct', 0.5) or 0.5)
+                        if ps0 > max_pct:
+                            decision['position_size_pct'] = max_pct
+                    except Exception:
+                        pass
+                    try:
+                        cd_min = float(getattr(Config, 'SOFT_COOLDOWN_MIN', 12) or 12)
+                        st_cd = float(state.get('pending_cooldown_minutes') or 0)
+                        state['pending_cooldown_minutes'] = max(st_cd, cd_min)
+                    except Exception:
+                        pass
+                    Log(f"[{symbol}] 越权小仓试单(buy): dtrend={dtrend_raw}, wp5={wp5}, evid={evid}/3")
             except Exception:
                 pass
             tmp_price = _choose_price('buy')
@@ -1926,7 +2219,33 @@ class TradeExecutor:
                 try:
                     lv = decision.get('scale_out_levels_r') or []
                     pc = decision.get('scale_out_pcts') or []
-                    if isinstance(lv, list) and isinstance(pc, list) and len(lv) == len(pc) and len(lv) > 0:
+                    # 分批启用门槛：单手/无再入能力 → 禁用分批，仅使用锁盈追踪
+                    enable_scale_out = True
+                    try:
+                        base_expected = int(volume or 0)
+                    except Exception:
+                        base_expected = 0
+                    try:
+                        min_lots_need = max(1, int(min_vol))
+                    except Exception:
+                        min_lots_need = 1
+                    try:
+                        available_after = max(0.0, equity - (used_margin + (float(volume or 0) * float(margin_per_lot))))
+                    except Exception:
+                        available_after = 0.0
+                    try:
+                        need_min_per_lot = float(margin_per_lot) * float(getattr(Config, 'NEW_TRADE_MARGIN_BUFFER', 1.05) or 1.05) * float(min_lots_need)
+                    except Exception:
+                        need_min_per_lot = 0.0
+                    can_reenter = (available_after >= need_min_per_lot)
+                    if base_expected < int(getattr(Config, 'MIN_LOTS_FOR_SCALE_OUT', 2)):
+                        enable_scale_out = False
+                        Log(f"[{symbol}] 单手/小仓入场，禁用分批止盈，启用锁盈追踪")
+                    elif bool(getattr(Config, 'SCALE_OUT_REQUIRE_REENTRY_CAPACITY', True)) and not can_reenter:
+                        enable_scale_out = False
+                        Log(f"[{symbol}] 无再入能力(可用≈{available_after:.0f} < 需最小{need_min_per_lot:.0f})，禁用分批止盈")
+
+                    if enable_scale_out and isinstance(lv, list) and isinstance(pc, list) and len(lv) == len(pc) and len(lv) > 0:
                         # 过滤非法/负数，并按R从小到大排序
                         pairs = [(float(lv[i]), float(pc[i])) for i in range(len(lv)) if lv[i] is not None and pc[i] is not None]
                         pairs = [(r, p) for (r, p) in pairs if r > 0 and p > 0]
@@ -1973,15 +2292,39 @@ class TradeExecutor:
                 if not isinstance(md_g, dict):
                     Log(f"[{symbol}] 入场拒绝(sell): 快照未就绪(last_market_data)"); return
                 wp5 = str(md_g.get('wave_phase_5m', 'N/A') or 'N/A').upper()
-                dtrend = str(md_g.get('d_trend', 'N/A') or 'N/A').upper()
-                if wp5 != 'IMPULSE_DOWN' or dtrend == 'UPTREND':
-                    Log(f"[{symbol}] 入场拒绝(sell): 多周期不一致(wp5={wp5}, dtrend={dtrend})"); return
+                dtrend_raw = str(md_g.get('d_trend', 'N/A') or 'N/A').upper()
+                dtrend_eff = ('NEUTRAL' if (dtrend_raw == 'N/A' and getattr(Config,'TREAT_DAILY_NA_AS_NEUTRAL', True)) else dtrend_raw)
+                mtf_mode = str(getattr(Config, 'MTF_MODE', 'soft') or 'soft').lower()
+                # 日线反向不再前置硬拒：交由后续严格反趋势门槛与小仓探路处理
+                allow_by_mtf = False
+                override_small = False
+                if wp5 == 'IMPULSE_DOWN':
+                    allow_by_mtf = True
+                elif mtf_mode == 'off':
+                    allow_by_mtf = True
+                elif mtf_mode == 'soft' and wp5 in ('CORRECTION', 'CHAN_CENTER', 'N/A'):
+                    allow_by_mtf = True
+                    override_small = True
+                    if wp5 == 'N/A':
+                        try:
+                            dc = state.get('data_collector'); c5 = len((md_g.get('closes_5m') or []))
+                            l1 = len(getattr(dc, 'kline_1m_buffer', []) or [])
+                            Log(f"[{symbol}] [提示] 软越权: 5m相位N/A( len5m={c5}, len1m={l1} )，按中性处理，小仓探路")
+                        except Exception:
+                            Log(f"[{symbol}] [提示] 软越权: 5m相位N/A，按中性处理，小仓探路")
+                else:
+                    try:
+                        dc = state.get('data_collector'); day_count = len(getattr(dc, 'kline_1d_buffer', []) or [])
+                    except Exception:
+                        day_count = -1
+                    Log(f"[{symbol}] 入场拒绝(sell): 多周期不一致(wp5={wp5}, dtrend={dtrend_raw}, day_count={day_count})"); return
                 atr_g = float(md_g.get('atr') or 0.0)
                 high20 = float(md_g.get('high_20') or last_price)
                 low20 = float(md_g.get('low_20') or last_price)
                 rng = max(0.0, high20 - low20)
                 ratio = (rng / max(1e-6, atr_g)) if atr_g else 0.0
-                if ratio < 1.2:
+                ratio_thr = 1.5 if mtf_mode == 'off' else 1.2
+                if ratio < ratio_thr:
                     Log(f"[{symbol}] 入场拒绝(sell): 微震荡(range20/ATR={ratio:.2f})"); return
                 try:
                     kbuf = getattr(state.get('data_collector'), 'kline_1m_buffer', [])
@@ -1989,14 +2332,32 @@ class TradeExecutor:
                 except Exception:
                     last_close = float(last_price)
                 tksz = float(PlatformAdapter.get_pricetick(symbol) or 0.01)
-                if not (last_close < (low20 - tksz)):
-                    Log(f"[{symbol}] 入场拒绝(sell): 未收盘确认跌破(low20)"); return
+                ema20_v = float(md_g.get('ema_20') or 0.0)
+                atr_v = float(md_g.get('atr') or 0.0)
+                ofz = float(md_g.get('of_z50') or 0.0)
+                vratio = float(md_g.get('volume_ratio') or 1.0)
+                breakout_ok = (last_close < low20)
+                pullback_ok = (ema20_v > 0 and atr_v > 0 and (high20 - ema20_v) <= (float(getattr(Config,'PULLBACK_ATR_FRAC',0.7)) * atr_v) and last_close < ema20_v)
+                momentum_ok = (ema20_v > 0 and last_close < ema20_v and (((ema20_v - last_close) >= (float(getattr(Config,'MOMENTUM_ATR_FRAC',0.06)) * atr_v)) or ofz <= -0.8 or vratio >= 1.2))
                 evid = 0
                 if float(md_g.get('volume_ratio') or 1.0) >= 1.2: evid += 1
                 if float(md_g.get('of_delta_20') or 0.0) < 0 and float(md_g.get('of_ma5') or 0.0) < 0: evid += 1
                 if float(md_g.get('of_z50') or 0.0) <= -0.8: evid += 1
-                if evid < 2:
-                    Log(f"[{symbol}] 入场拒绝(sell): 证据不足(of/vol)={evid}/3"); return
+                # 三件套作为加分证据
+                triad_hit = (breakout_ok or pullback_ok or momentum_ok)
+                if triad_hit:
+                    evid += 1
+                # 动态证据阈值：动量/突破或高信心时降至配置最低值
+                try:
+                    ai_conf = float(decision.get('confidence', 0) or 0)
+                except Exception:
+                    ai_conf = 0.0
+                try:
+                    min_evid = int(getattr(Config, 'EVIDENCE_MIN_ON_MOMENTUM', 1)) if ((breakout_ok or momentum_ok) or (ai_conf >= float(getattr(Config,'MIN_CONF_FOR_NO_TRIAD',0.80)))) else int(getattr(Config, 'EVIDENCE_MIN_DEFAULT', 2))
+                except Exception:
+                    min_evid = 1 if ((breakout_ok or momentum_ok) or (ai_conf >= 0.80)) else 2
+                if evid < min_evid:
+                    Log(f"[{symbol}] 入场拒绝(sell): 证据不足(evid={evid}/{min_evid}); 三件套 b/o/m={int(breakout_ok)}/{int(pullback_ok)}/{int(momentum_ok)}, z50={ofz:.2f}, vr={vratio:.2f}"); return
                 try:
                     ai_sl0 = decision.get('stop_loss')
                     if ai_sl0 is not None:
@@ -2008,6 +2369,28 @@ class TradeExecutor:
                             Log(f"[{symbol}] 入场拒绝(sell): 边际不足(risk={risk_ticks:.1f}<1.5×fric={fric_ticks:.1f})"); return
                 except Exception:
                     pass
+                if override_small:
+                    try:
+                        rrr = float(decision.get('risk_reward_ratio', 0) or 0)
+                    except Exception:
+                        rrr = 0
+                    min_rrr = float(getattr(Config, 'SOFT_MIN_RRR', 2.0) or 2.0)
+                    if rrr and rrr < min_rrr:
+                        Log(f"[{symbol}] 入场拒绝(sell-越权): RRR不足({rrr:.2f}<{min_rrr:.2f})"); return
+                    try:
+                        max_pct = float(getattr(Config, 'SOFT_MAX_PCT', 0.10) or 0.10)
+                        ps0 = float(decision.get('position_size_pct', 0.5) or 0.5)
+                        if ps0 > max_pct:
+                            decision['position_size_pct'] = max_pct
+                    except Exception:
+                        pass
+                    try:
+                        cd_min = float(getattr(Config, 'SOFT_COOLDOWN_MIN', 12) or 12)
+                        st_cd = float(state.get('pending_cooldown_minutes') or 0)
+                        state['pending_cooldown_minutes'] = max(st_cd, cd_min)
+                    except Exception:
+                        pass
+                    Log(f"[{symbol}] 越权小仓试单(sell): dtrend={dtrend_raw}, wp5={wp5}, evid={evid}/3")
             except Exception:
                 pass
             tmp_price = _choose_price('sell')
@@ -2125,7 +2508,33 @@ class TradeExecutor:
                 try:
                     lv = decision.get('scale_out_levels_r') or []
                     pc = decision.get('scale_out_pcts') or []
-                    if isinstance(lv, list) and isinstance(pc, list) and len(lv) == len(pc) and len(lv) > 0:
+                    # 分批启用门槛：单手/无再入能力 → 禁用分批，仅使用锁盈追踪
+                    enable_scale_out = True
+                    try:
+                        base_expected = int(volume or 0)
+                    except Exception:
+                        base_expected = 0
+                    try:
+                        min_lots_need = max(1, int(min_vol))
+                    except Exception:
+                        min_lots_need = 1
+                    try:
+                        available_after = max(0.0, equity - (used_margin + (float(volume or 0) * float(margin_per_lot))))
+                    except Exception:
+                        available_after = 0.0
+                    try:
+                        need_min_per_lot = float(margin_per_lot) * float(getattr(Config, 'NEW_TRADE_MARGIN_BUFFER', 1.05) or 1.05) * float(min_lots_need)
+                    except Exception:
+                        need_min_per_lot = 0.0
+                    can_reenter = (available_after >= need_min_per_lot)
+                    if base_expected < int(getattr(Config, 'MIN_LOTS_FOR_SCALE_OUT', 2)):
+                        enable_scale_out = False
+                        Log(f"[{symbol}] 单手/小仓入场，禁用分批止盈，启用锁盈追踪")
+                    elif bool(getattr(Config, 'SCALE_OUT_REQUIRE_REENTRY_CAPACITY', True)) and not can_reenter:
+                        enable_scale_out = False
+                        Log(f"[{symbol}] 无再入能力(可用≈{available_after:.0f} < 需最小{need_min_per_lot:.0f})，禁用分批止盈")
+
+                    if enable_scale_out and isinstance(lv, list) and isinstance(pc, list) and len(lv) == len(pc) and len(lv) > 0:
                         pairs = [(float(lv[i]), float(pc[i])) for i in range(len(lv)) if lv[i] is not None and pc[i] is not None]
                         pairs = [(r, p) for (r, p) in pairs if r > 0 and p > 0]
                         pairs.sort(key=lambda x: x[0])
@@ -2168,21 +2577,53 @@ class TradeExecutor:
             state['position_avg_price'] = 0
 
         elif signal == 'adjust_stop' and current_volume != 0:
-            # 动态调整止损
+            # 动态调整止损：方向与最小间距护栏
+            _sl_raw = decision.get('stop_loss', None)
+            try:
+                new_sl = float(_sl_raw)
+            except Exception:
+                Log(f"[{symbol}] 调整止损拒绝: stop_loss无效({repr(_sl_raw)})")
+                return
+            # 读取必要环境
+            tksz = float(PlatformAdapter.get_pricetick(symbol) or 0.01)
+            atr_val = 0.0
+            try:
+                atr_val = float((state.get('last_market_data') or {}).get('atr') or 0.0)
+            except Exception:
+                atr_val = 0.0
+            try:
+                min_ticks = max(1, int(getattr(Config, 'MIN_STOP_TICKS', 10)))
+            except Exception:
+                min_ticks = 10
+            try:
+                atr_mult = float(getattr(Config, 'MIN_STOP_ATR_MULT', 0.4))
+            except Exception:
+                atr_mult = 0.4
+            min_gap = max(min_ticks * tksz, atr_val * atr_mult)
+            # 方向检查 + 最小距离
+            if current_volume > 0:
+                # 多头：止损需在当前价下方，且距当前价≥min_gap
+                if not (new_sl < last_price and (last_price - new_sl) >= min_gap):
+                    Log(f"[{symbol}] 调整止损拒绝: 多头止损方向/间距不合规(new={new_sl:.2f}, last={last_price:.2f}, min_gap={min_gap:.2f})")
+                    return
+            elif current_volume < 0:
+                # 空头：止损需在当前价上方，且距当前价≥min_gap
+                if not (new_sl > last_price and (new_sl - last_price) >= min_gap):
+                    Log(f"[{symbol}] 调整止损拒绝: 空头止损方向/间距不合规(new={new_sl:.2f}, last={last_price:.2f}, min_gap={min_gap:.2f})")
+                    return
+            # 同步AI决策里的SL/目标与追踪参数
             if isinstance(state.get('ai_decision'), dict):
-                state['ai_decision']['stop_loss'] = decision.get('stop_loss')
-                state['ai_decision']['profit_target'] = decision.get('profit_target')
-                # 同步追踪配置
-                ttype = str(decision.get('trailing_type', state.get('trailing',{}).get('type','none')) or 'none').lower()
-                state['trailing'] = {
-                    'type': ttype,
-                    'atr_mult': float(decision.get('trailing_atr_mult', state.get('trailing',{}).get('atr_mult',0)) or 0),
-                    'percent': float(decision.get('trailing_percent', state.get('trailing',{}).get('percent',0)) or 0),
-                    'time_stop_minutes': float(decision.get('time_stop_minutes', state.get('trailing',{}).get('time_stop_minutes',0)) or 0),
-                }
-            _sl = decision.get('stop_loss')
-            _sl_txt = f"{float(_sl):.2f}" if isinstance(_sl, (int, float)) else "N/A"
-            Log(f"[{symbol}] AI决策: 调整止损至 {_sl_txt}")
+                state['ai_decision']['stop_loss'] = new_sl
+                if decision.get('profit_target') is not None:
+                    state['ai_decision']['profit_target'] = decision.get('profit_target')
+            ttype = str(decision.get('trailing_type', state.get('trailing',{}).get('type','none')) or 'none').lower()
+            state['trailing'] = {
+                'type': ttype,
+                'atr_mult': float(decision.get('trailing_atr_mult', state.get('trailing',{}).get('atr_mult',0)) or 0),
+                'percent': float(decision.get('trailing_percent', state.get('trailing',{}).get('percent',0)) or 0),
+                'time_stop_minutes': float(decision.get('time_stop_minutes', state.get('trailing',{}).get('time_stop_minutes',0)) or 0),
+            }
+            Log(f"[{symbol}] AI决策: 调整止损至 {new_sl:.2f} (last={last_price:.2f}, min_gap={min_gap:.2f})")
 
         # 冷却时间（改为：仅在成交后由 on_order_status 生效）
         try:
@@ -2784,6 +3225,10 @@ def on_init(context):
         context.symbols = list(Config.SYMBOLS) if hasattr(Config, 'SYMBOLS') else [Config.SYMBOL]
         Log(f"========== AI自主交易策略启动 ==========")
         Log(f"交易品种: {', '.join(context.symbols)}")
+        try:
+            Log(f"[AI] 模型: {getattr(Config,'DEEPSEEK_MODEL','')} @ {getattr(Config,'DEEPSEEK_API_URL','')}, MTF_MODE={getattr(Config,'MTF_MODE','')}, EVIDENCE_MIN={getattr(Config,'EVIDENCE_MIN_DEFAULT',2)}/{getattr(Config,'EVIDENCE_MIN_ON_MOMENTUM',1)}, SOFT_RRR={getattr(Config,'SOFT_MIN_RRR',2.0)}, SOFT_MAX_PCT={getattr(Config,'SOFT_MAX_PCT',0.10)}, SOFT_COOLDOWN_MIN={getattr(Config,'SOFT_COOLDOWN_MIN',12)}")
+        except Exception:
+            pass
         Log(f"AI决策间隔: {Config.AI_DECISION_INTERVAL}秒")
         Log(f"安全边界: 单笔最大亏损{Config.MAX_SINGLE_TRADE_LOSS_PCT*100:.1f}%, 单日最大亏损{Config.MAX_DAILY_LOSS_PCT*100:.1f}%")
 
@@ -3437,8 +3882,22 @@ def on_bar(context, bars):
             ind = dc.calculate_indicators()
             if ind:
                 st['last_indicators'] = ind
-                # 构建市场快照（需要最近tick）
+                # 构建市场快照（优先使用最近tick；若无tick则合成一个轻量tick）
                 last_tick = st.get('last_tick')
+                try:
+                    if last_tick is None and getattr(dc, 'kline_1m_buffer', None):
+                        from types import SimpleNamespace as _SN
+                        try:
+                            lb = dc.kline_1m_buffer[-1]
+                            px = float(lb.get('close') or 0.0)
+                        except Exception:
+                            px = 0.0
+                        last_tick = _SN(last_price=px, price=px, bid_price_1=px, ask_price_1=px,
+                                        bid_volume_1=0, ask_volume_1=0, last_volume=0,
+                                        strtime=datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                        Log(f"[{sym}] on_bar 使用合成tick构建快照")
+                except Exception:
+                    pass
                 if last_tick is not None:
                     try:
                         md = collect_market_data(context, sym, last_tick, ind, dc, st)
@@ -4219,6 +4678,7 @@ def collect_market_data(context, symbol, tick, indicators, data_collector, state
     macd_hist_s = _coerce('macd_hist', 0.0)
     rsi_s = _coerce('rsi', 0.0)
     atr_s = _coerce('atr', 0.0)
+    atr_5m_s = _coerce('atr_5m', 0.0)
     high_20_s = _coerce('high_20', current_price)
     low_20_s = _coerce('low_20', current_price)
     pr_pct_s = _coerce('price_range_pct', 0.0)
@@ -4283,7 +4743,31 @@ def collect_market_data(context, symbol, tick, indicators, data_collector, state
         'high_20': high_20_s,
         'low_20': low_20_s,
         'price_range_pct': pr_pct_s,
+        'atr_5m': atr_5m_s,
     }
+
+    # 成本-收益估计辅助：以tick为单位的摩擦提示（spread + 预计滑点 + 手续费）
+    try:
+        tk = float(market_data['tick_size'] or 0.01)
+    except Exception:
+        tk = 0.01
+    try:
+        fees_t = float(getattr(Config, 'FEES_TICK_HINT', 0.5) or 0.0)
+    except Exception:
+        fees_t = 0.5
+    try:
+        slip_t = float(getattr(Config, 'SLIPPAGE_TICK_HINT', 1.0) or 0.0)
+    except Exception:
+        slip_t = 1.0
+    try:
+        st_ticks = (spread / tk) if tk > 0 else 0.0
+    except Exception:
+        st_ticks = 0.0
+    frict_ticks = max(0.0, st_ticks + slip_t + fees_t)
+    market_data['fees_tick_hint'] = fees_t
+    market_data['slippage_tick_hint'] = slip_t
+    market_data['spread_ticks_hint'] = st_ticks
+    market_data['friction_ticks_hint'] = frict_ticks
 
     # 合并订单流摘要（简版）：基于近tick窗口的delta
     try:
